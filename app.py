@@ -4,67 +4,99 @@ import requests
 from bs4 import BeautifulSoup
 from io import BytesIO
 
-# ---------------------- CONFIG ----------------------
-
+# =================================================
+# CONFIGURAÇÃO DA PÁGINA
+# =================================================
 st.set_page_config(page_title="Coletor de Textos ALMG", layout="wide")
 st.title("📄 Coletor de Textos de Normas da ALMG")
 
 st.markdown("""
-Envie um arquivo `.csv` ou `.xlsx` com as colunas:
+Envie um arquivo `.csv` ou `.xlsx` contendo as colunas:
+
 - `tipo_sigla`
 - `numero`
 - `ano`
 
-Depois selecione o(s) ano(s) e clique em **Coletar textos**.
+Selecione o(s) ano(s) desejado(s) e clique em **Coletar textos**.
 """)
 
-# ---------------------- FUNÇÃO: Extrair texto da norma ----------------------
-
+# =================================================
+# FUNÇÃO DE EXTRAÇÃO DE TEXTO
+# =================================================
 def extrair_texto_html(url):
     try:
         resp = requests.get(
             url,
-            timeout=15,
+            timeout=20,
             headers={"User-Agent": "Mozilla/5.0"}
         )
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 1. Casos como LEI, DEC, DEL
-        span = soup.find("span", class_="js_interpretarLinks textNorma js_interpretarLinksDONE")
-        if span:
-            texto = span.get_text(separator="\n", strip=True)
+        # -------------------------------------------------
+        # 1️⃣ CASO PADRÃO (LEI, DEC etc.)
+        # -------------------------------------------------
+        span_norma = soup.find(
+            "span",
+            class_="js_interpretarLinks textNorma js_interpretarLinksDONE"
+        )
+        if span_norma:
+            texto = span_norma.get_text(separator="\n", strip=True)
             if texto:
                 return texto
 
-        # 2. Casos como DCS, DCE etc. no <main>
+        # -------------------------------------------------
+        # 2️⃣ CASO DCS, DCE E OUTROS (texto no <main>)
+        # -------------------------------------------------
         main = soup.find("main")
-        if main:
-            # Remove elementos visuais
-            for tag in main.find_all(["nav", "header", "footer", "script", "style"]):
-                tag.decompose()
+        if not main:
+            return ""
 
-            texto = main.get_text(separator="\n", strip=True)
-            linhas = [l.strip() for l in texto.splitlines() if l.strip()]
-            texto_final = "\n".join(linhas)
+        # Remove APENAS elementos de interface
+        for tag in main.find_all([
+            "nav", "header", "footer", "script", "style",
+            "iframe", "form", "button", "svg"
+        ]):
+            tag.decompose()
 
-            # Verifica se é mensagem de erro
-            mensagens_erro = [
-                "texto não encontrado",
-                "não foi possível localizar",
-                "erro ao acessar"
-            ]
-            if any(msg in texto_final.lower() for msg in mensagens_erro):
-                return ""  # limpa mensagens artificiais
+        # Remove blocos explicitamente de compartilhamento
+        for elem in main.find_all(["div", "span", "a"]):
+            txt = elem.get_text(strip=True).lower()
+            if any(p in txt for p in [
+                "compartilhar",
+                "whatsapp",
+                "telegram",
+                "facebook",
+                "twitter",
+                "imprimir",
+                "solicitar norma em áudio"
+            ]):
+                elem.decompose()
 
-            return texto_final
+        # Texto final
+        texto_bruto = main.get_text(separator="\n", strip=True)
 
-        return ""
+        # Normalização leve (sem agressividade)
+        linhas = [l.strip() for l in texto_bruto.splitlines() if l.strip()]
+        texto_final = "\n".join(linhas)
+
+        # Elimina apenas mensagens artificiais do scraper
+        mensagens_erro = [
+            "texto não encontrado",
+            "não foi possível localizar",
+            "erro ao acessar"
+        ]
+        if any(msg in texto_final.lower() for msg in mensagens_erro):
+            return ""
+
+        return texto_final
+
     except Exception:
         return ""
 
-# ---------------------- FUNÇÃO: Montar link da norma ----------------------
-
+# =================================================
+# FUNÇÃO PARA GERAR LINKS
+# =================================================
 def gerar_links(tipo, numero, ano):
     base = f"https://www.almg.gov.br/legislacao-mineira/texto/{tipo}/{numero}/{ano}"
     return {
@@ -72,9 +104,13 @@ def gerar_links(tipo, numero, ano):
         "Consolidado": base + "/?cons=1"
     }
 
-# ---------------------- UPLOAD E PRÉ-PROCESSAMENTO ----------------------
-
-arquivo = st.file_uploader("📤 Envie seu arquivo", type=["csv", "xlsx"])
+# =================================================
+# UPLOAD DO ARQUIVO
+# =================================================
+arquivo = st.file_uploader(
+    "📤 Envie o arquivo com as normas",
+    type=["csv", "xlsx"]
+)
 
 if arquivo:
     try:
@@ -83,53 +119,56 @@ if arquivo:
         st.error(f"Erro ao ler o arquivo: {e}")
         st.stop()
 
-    colunas_necessarias = {"tipo_sigla", "numero", "ano"}
-    if not colunas_necessarias.issubset(df.columns):
+    colunas = {"tipo_sigla", "numero", "ano"}
+    if not colunas.issubset(df.columns):
         st.error("⚠️ O arquivo deve conter as colunas: tipo_sigla, numero, ano")
         st.stop()
 
     df = df[["tipo_sigla", "numero", "ano"]].dropna().drop_duplicates()
     df["ano"] = df["ano"].astype(str)
 
-    anos_disponiveis = sorted(df["ano"].unique(), reverse=True)
-    anos_selecionados = st.multiselect("📅 Selecione o(s) ano(s)", anos_disponiveis)
+    anos = sorted(df["ano"].unique(), reverse=True)
+    anos_sel = st.multiselect("📅 Selecione o(s) ano(s)", anos)
 
-    if anos_selecionados:
-        df_filtrado = df[df["ano"].isin(anos_selecionados)]
+    if anos_sel:
+        df_filtrado = df[df["ano"].isin(anos_sel)]
         st.markdown(f"🔎 Normas selecionadas: **{len(df_filtrado)}**")
 
         if len(df_filtrado) > 50:
-            st.warning("⚠️ Limite atual: selecione até 50 normas por vez.")
+            st.warning("⚠️ Limite atual: até 50 normas por execução.")
             st.stop()
 
         if st.button(f"🚀 Coletar textos de {len(df_filtrado)} normas"):
-            st.info("⏳ Coletando textos… aguarde.")
+            st.info("⏳ Coletando textos…")
             resultados = []
             barra = st.progress(0)
             total = len(df_filtrado)
 
             for i, row in df_filtrado.iterrows():
-                tipo, numero, ano = row["tipo_sigla"], row["numero"], row["ano"]
-                links = gerar_links(tipo, numero, ano)
+                links = gerar_links(row["tipo_sigla"], row["numero"], row["ano"])
 
                 for versao, url in links.items():
-                    texto = extrair_texto_html(url)
                     resultados.append({
-                        "tipo_sigla": tipo,
-                        "numero": numero,
-                        "ano": ano,
+                        "tipo_sigla": row["tipo_sigla"],
+                        "numero": row["numero"],
+                        "ano": row["ano"],
                         "versao": versao,
                         "url": url,
-                        "texto": texto
+                        "texto": extrair_texto_html(url)
                     })
 
                 barra.progress((i + 1) / total)
 
             df_resultado = pd.DataFrame(resultados)
-            st.success("✅ Coleta finalizada!")
+            st.success("✅ Coleta finalizada")
             st.dataframe(df_resultado)
 
             buffer = BytesIO()
             df_resultado.to_csv(buffer, index=False, encoding="utf-8-sig")
-            st.download_button("⬇️ Baixar CSV com os textos", data=buffer.getvalue(),
-                               file_name="textos_normas_almg.csv", mime="text/csv")
+
+            st.download_button(
+                "⬇️ Baixar CSV com os textos",
+                data=buffer.getvalue(),
+                file_name="textos_normas_almg.csv",
+                mime="text/csv"
+            )
