@@ -7,9 +7,9 @@ from io import BytesIO
 st.set_page_config(page_title="Coletor de Textos da ALMG", layout="wide")
 st.title("📄 Coletor de Normas da ALMG (Texto Original e Consolidado)")
 
-st.markdown("Envie um arquivo com as colunas: `tipo_sigla`, `numero`, `ano`.")
+st.markdown("Envie um arquivo com as colunas: `tipo_sigla`, `numero`, `ano`. Em seguida, selecione o **ano desejado** para buscar os textos.")
 
-# Função para gerar links
+# Função para gerar os dois links
 def gerar_links(tipo, numero, ano):
     base = f"https://www.almg.gov.br/legislacao-mineira/texto/{tipo}/{numero}/{ano}"
     return {
@@ -17,7 +17,7 @@ def gerar_links(tipo, numero, ano):
         "Consolidado": base + "/?cons=1"
     }
 
-# Função para extrair texto da norma
+# Função para extrair o texto da norma
 def extrair_texto_html(url):
     try:
         resp = requests.get(url, timeout=10)
@@ -32,7 +32,7 @@ def extrair_texto_html(url):
         return f"❌ Erro ao acessar: {str(e)}"
 
 # Upload do arquivo
-arquivo = st.file_uploader("📥 Envie um CSV ou Excel", type=["csv", "xlsx"])
+arquivo = st.file_uploader("📥 Envie um CSV ou Excel com as normas", type=["csv", "xlsx"])
 
 if arquivo:
     try:
@@ -44,41 +44,53 @@ if arquivo:
         st.error(f"Erro ao ler o arquivo: {e}")
         st.stop()
 
+    # Verifica se as colunas obrigatórias existem
     colunas_necessarias = {"tipo_sigla", "numero", "ano"}
     if not colunas_necessarias.issubset(df.columns):
-        st.error("Arquivo deve conter as colunas: tipo_sigla, numero, ano")
+        st.error("⚠️ O arquivo deve conter as colunas: tipo_sigla, numero, ano")
         st.stop()
 
-    # Remover duplicados e nulos
+    # Limpeza inicial
     df = df[["tipo_sigla", "numero", "ano"]].dropna().drop_duplicates()
+    df["ano"] = df["ano"].astype(str)
 
-    if st.button("🚀 Iniciar Coleta de Textos"):
-        st.info(f"Buscando textos para {len(df)} normas... Aguarde.")
+    # Interface para escolher o(s) ano(s)
+    anos_disponiveis = sorted(df["ano"].unique(), reverse=True)
+    anos_selecionados = st.multiselect("📅 Selecione o(s) ano(s) para coletar os textos", anos_disponiveis)
 
-        resultados = []
-        progress = st.progress(0)
-        for i, row in df.iterrows():
-            tipo, numero, ano = row["tipo_sigla"], row["numero"], row["ano"]
-            links = gerar_links(tipo, numero, ano)
+    if anos_selecionados:
+        df_filtrado = df[df["ano"].isin(anos_selecionados)]
 
-            for versao, url in links.items():
-                texto = extrair_texto_html(url)
-                resultados.append({
-                    "tipo_sigla": tipo,
-                    "numero": numero,
-                    "ano": ano,
-                    "versao": versao,
-                    "url": url,
-                    "texto": texto
-                })
-            progress.progress((i + 1) / len(df))
+        if st.button(f"🚀 Iniciar Coleta para {len(df_filtrado)} normas"):
+            st.info("Iniciando coleta... isso pode levar alguns minutos.")
 
-        df_final = pd.DataFrame(resultados)
-        st.success("✅ Coleta finalizada!")
-        st.dataframe(df_final.head(50))
+            resultados = []
+            barra = st.progress(0)
 
-        # Botão de download
-        buffer = BytesIO()
-        df_final.to_csv(buffer, index=False, encoding="utf-8-sig")
-        st.download_button("⬇️ Baixar CSV com os textos", data=buffer.getvalue(),
-                           file_name="textos_normas_almg.csv", mime="text/csv")
+            for i, row in df_filtrado.iterrows():
+                tipo, numero, ano = row["tipo_sigla"], row["numero"], row["ano"]
+                links = gerar_links(tipo, numero, ano)
+
+                for versao, url in links.items():
+                    texto = extrair_texto_html(url)
+                    resultados.append({
+                        "tipo_sigla": tipo,
+                        "numero": numero,
+                        "ano": ano,
+                        "versao": versao,
+                        "url": url,
+                        "texto": texto
+                    })
+
+                barra.progress((i + 1) / len(df_filtrado))
+
+            df_resultado = pd.DataFrame(resultados)
+            st.success("✅ Coleta finalizada!")
+
+            st.dataframe(df_resultado.head(50))
+
+            # Botão para baixar CSV
+            buffer = BytesIO()
+            df_resultado.to_csv(buffer, index=False, encoding="utf-8-sig")
+            st.download_button("⬇️ Baixar CSV com os textos", data=buffer.getvalue(),
+                               file_name="textos_normas_filtradas.csv", mime="text/csv")
