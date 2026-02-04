@@ -103,7 +103,7 @@ if arquivo:
         if len(df_filtrado) == 0:
             st.warning("⚠️ Nenhuma norma para os anos selecionados.")
         else:
-            if st.button(f"🚀 Gerar textos para {len(df_filtrado)} normas"):
+            if st.button(f"🚀 Coletar textos para {len(df_filtrado)} normas"):
                 st.info("Coletando textos… aguarde.")
 
                 resultados = []
