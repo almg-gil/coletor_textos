@@ -4,16 +4,20 @@ import requests
 from bs4 import BeautifulSoup
 from io import BytesIO
 
-# -------------------------------------------------
-# CONFIGURAÇÃO DA PÁGINA
-# -------------------------------------------------
+# -----------------------------------------------
+# CONFIGURAÇÃO INICIAL
+# -----------------------------------------------
 st.set_page_config(page_title="Coletor de Textos ALMG", layout="wide")
 st.title("📄 Coletor de Textos de Normas da ALMG")
-st.markdown("1. Envie um arquivo com `tipo_sigla`, `numero`, `ano`  \n2. Selecione os anos  \n3. Gere o CSV com os textos")
+st.markdown("""
+1. Envie um arquivo `.csv` ou `.xlsx` com as colunas `tipo_sigla`, `numero`, `ano`  
+2. Selecione o(s) ano(s)  
+3. Gere e baixe o arquivo com os textos das normas
+""")
 
-# -------------------------------------------------
+# -----------------------------------------------
 # FUNÇÃO DE EXTRAÇÃO DE TEXTO HTML
-# -------------------------------------------------
+# -----------------------------------------------
 def extrair_texto_html(url):
     try:
         resp = requests.get(
@@ -24,43 +28,39 @@ def extrair_texto_html(url):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Tentativa 1: span tradicional usado por LEI/DEC
+        # 1. span usado por leis/decretos
         span = soup.find("span", class_="js_interpretarLinks textNorma js_interpretarLinksDONE")
         if span:
             texto = span.get_text(separator="\n", strip=True)
             if len(texto) > 50:
                 return texto
 
-        # Tentativa 2: extrair do <main> (usado por DCS, DCE, etc.)
+        # 2. <main> — estrutura usada por DCS, DCE etc.
         main = soup.find("main")
         if main:
-            # Remove elementos irrelevantes
             for tag in main.find_all(["nav", "header", "footer", "script", "style", "button", "aside"]):
                 tag.decompose()
 
-            # Remove blocos com "compartilhar"
             for div in main.find_all("div"):
-                if "compartilhar" in div.get_text(strip=True).lower():
+                txt = div.get_text(strip=True).lower()
+                if "compartilhar" in txt or "solicitar norma" in txt or "imprimir" in txt:
                     div.decompose()
 
             texto = main.get_text(separator="\n", strip=True)
+            linhas = [linha.strip() for linha in texto.splitlines() if linha.strip()]
+            texto_final = "\n".join(linhas)
 
-            # Captura a partir de palavras-chave
-            for marcador in ["DELIBERA", "RESOLVE", "Art. 1º", "Art. 1o", "Art. 1"]:
-                if marcador in texto:
-                    return marcador + "\n" + texto.split(marcador, 1)[-1].strip()
+            if len(texto_final) > 100:
+                return texto_final
 
-            # Se não encontrou marcador, retorna tudo (se for significativo)
-            if len(texto) > 100:
-                return texto.strip()
+        return ""  # ← deixa em branco se não encontrar texto útil
+    except Exception:
+        return ""  # ← também deixa em branco se der erro
+        
 
-        return "❌ Texto não encontrado"
-    except Exception as e:
-        return f"❌ Erro ao acessar: {str(e)}"
-
-# -------------------------------------------------
-# GERAÇÃO DAS URLs
-# -------------------------------------------------
+# -----------------------------------------------
+# GERAÇÃO DOS LINKS DAS NORMAS
+# -----------------------------------------------
 def gerar_links(tipo, numero, ano):
     base = f"https://www.almg.gov.br/legislacao-mineira/texto/{tipo}/{numero}/{ano}"
     return {
@@ -68,10 +68,10 @@ def gerar_links(tipo, numero, ano):
         "Consolidado": base + "/?cons=1"
     }
 
-# -------------------------------------------------
-# UPLOAD E TRATAMENTO DO ARQUIVO
-# -------------------------------------------------
-arquivo = st.file_uploader("📤 Envie um arquivo CSV ou Excel", type=["csv", "xlsx"])
+# -----------------------------------------------
+# UPLOAD DO ARQUIVO
+# -----------------------------------------------
+arquivo = st.file_uploader("📤 Envie um arquivo com as normas", type=["csv", "xlsx"])
 
 if arquivo:
     try:
@@ -85,11 +85,9 @@ if arquivo:
         st.error("⚠️ O arquivo deve conter as colunas: tipo_sigla, numero, ano")
         st.stop()
 
-    # Limpeza básica
     df = df[["tipo_sigla", "numero", "ano"]].dropna().drop_duplicates()
     df["ano"] = df["ano"].astype(str)
 
-    # Filtro por ano
     anos_disponiveis = sorted(df["ano"].unique(), reverse=True)
     anos_selecionados = st.multiselect("📅 Selecione o(s) ano(s)", anos_disponiveis)
 
@@ -97,9 +95,8 @@ if arquivo:
         df_filtrado = df[df["ano"].isin(anos_selecionados)]
         st.markdown(f"🔎 Normas encontradas: **{len(df_filtrado)}**")
 
-        # Limite de segurança
         if len(df_filtrado) > 50:
-            st.warning("⚠️ Limite temporário: selecione até 50 normas por vez para evitar travamentos.")
+            st.warning("⚠️ Limite temporário: selecione até 50 normas por vez.")
             st.stop()
 
         if st.button(f"🚀 Coletar textos para {len(df_filtrado)} normas"):
@@ -129,7 +126,7 @@ if arquivo:
             st.success("✅ Coleta finalizada!")
             st.dataframe(df_resultado.head(50))
 
-            # Download do CSV
+            # Download do resultado
             buffer = BytesIO()
             df_resultado.to_csv(buffer, index=False, encoding="utf-8-sig")
             st.download_button("⬇️ Baixar CSV com os textos", data=buffer.getvalue(),
