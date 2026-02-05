@@ -45,7 +45,7 @@ REQUEST_TIMEOUT = 30
 
 st.set_page_config(page_title="Motor de Busca ALMG (Release Index)", layout="wide")
 st.title("📚 Motor de Busca ALMG — Índice via Release (Whoosh)")
-st.caption("Baixa index.zip do GitHub Release e permite busca booleana + filtros por campos (com multiselect de tipos).")
+st.caption("Baixa index.zip do GitHub Release e permite busca booleana + filtros por campos (multiselect de tipos).")
 
 
 def mkdirp(path: str) -> None:
@@ -136,7 +136,7 @@ def save_local_release_meta(remote_release: dict, zip_hash: str) -> None:
 
 
 def get_schema() -> Schema:
-    # fallback mínimo
+    # fallback mínimo (índice real vem do build)
     return Schema(
         doc_id=ID(stored=True, unique=True),
         tipo_sigla=ID(stored=True),
@@ -284,6 +284,18 @@ try:
 except Exception:
     st.sidebar.metric("Docs no índice", 0)
 
+# Diagnóstico: quais tipos existem no índice?
+with st.sidebar.expander("🔎 Diagnóstico (tipos no índice)", expanded=False):
+    try:
+        with ix.searcher() as s:
+            tipos = sorted([
+                t.decode("utf-8") if isinstance(t, (bytes, bytearray)) else str(t)
+                for t in s.lexicon("tipo_sigla")
+            ])
+        st.write(tipos)
+    except Exception as e:
+        st.error(e)
+
 
 st.subheader("🔎 Buscar no índice (booleana + campos)")
 
@@ -295,8 +307,8 @@ expr = col1.text_input(
 limit = col2.number_input("Qtde de resultados", min_value=5, max_value=200, value=30, step=5)
 
 f1, f2, f3, f4 = st.columns(4)
-f_tipos = f1.multiselect("tipo_sigla (opcional)", TYPES, default=["LEI"])
-f_ano = f2.text_input("ano (opcional)", value="2026")
+f_tipos = f1.multiselect("tipo_sigla (opcional)", TYPES, default=[])
+f_ano = f2.text_input("ano (opcional)", value="")
 f_num = f3.text_input("numero (opcional)", value="")
 f_versao = f4.selectbox("versao (opcional)", ["", "Original", "Consolidado"], index=0)
 
