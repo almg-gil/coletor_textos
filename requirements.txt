@@ -1,4 +1,7 @@
-streamlit
-pandas
-requests
-beautifulsoup4
+streamlit==1.41.1
+pandas==2.2.3
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+openpyxl==3.1.5
+whoosh==2.7.4
