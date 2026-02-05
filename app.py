@@ -2,124 +2,64 @@ import os
 import re
 import time
 from io import BytesIO
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from opensearchpy import OpenSearch, helpers
+
+from whoosh import index
+from whoosh.fields import Schema, TEXT, KEYWORD, ID, NUMERIC
+from whoosh.qparser import MultifieldParser, OrGroup
+from whoosh.query import And, Term, Every
 
 # =================================================
 # CONFIG
 # =================================================
-st.set_page_config(page_title="Coletor + Busca (OpenSearch) - ALMG", layout="wide")
+st.set_page_config(page_title="Coletor + Busca (Whoosh) - ALMG", layout="wide")
 
-APP_TITLE = "📚 Coletor e Motor de Busca (Booleano) - Normas ALMG"
-INDEX = os.getenv("OPENSEARCH_INDEX", "normas_almg")
-
-OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
-OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
-OPENSEARCH_USER = os.getenv("OPENSEARCH_USER", "")  # opcional
-OPENSEARCH_PASS = os.getenv("OPENSEARCH_PASS", "")  # opcional
-OPENSEARCH_USE_SSL = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
+APP_TITLE = "📚 Coletor e Motor de Busca (Booleano) — Normas ALMG (Streamlit Cloud)"
+DATA_DIR = "data"
+INDEX_DIR = os.path.join(DATA_DIR, "index")
 
 DEFAULT_TIMEOUT = 20
-MAX_COLETA_UI = 50  # limite de segurança na UI
+MAX_COLETA_UI = 50  # limite de segurança na UI (evita travar Streamlit Cloud)
 
 # =================================================
 # UI HEADER
 # =================================================
 st.title(APP_TITLE)
 st.caption(
-    "Upload -> Coleta HTML -> Indexação no OpenSearch -> Busca booleana com filtros por campos."
+    "Upload → Coleta HTML → Indexação local (Whoosh) → Busca booleana + filtros por campos. "
+    "Ideal para rodar 100% no Streamlit Cloud."
 )
 
-with st.expander("⚙️ Configuração (host/índice)", expanded=False):
-    st.write("Você pode mudar via variáveis de ambiente também.")
-    st.text_input("OpenSearch host", value=OPENSEARCH_HOST, key="cfg_host")
-    st.number_input("OpenSearch port", value=OPENSEARCH_PORT, step=1, key="cfg_port")
-    st.text_input("Índice", value=INDEX, key="cfg_index")
-    st.toggle("Usar SSL", value=OPENSEARCH_USE_SSL, key="cfg_ssl")
-
-
-# =================================================
-# OPENSEARCH
-# =================================================
-@st.cache_resource(show_spinner=False)
-def get_client(host: str, port: int, use_ssl: bool, user: str = "", pwd: str = "") -> OpenSearch:
-    auth = (user, pwd) if user and pwd else None
-    return OpenSearch(
-        hosts=[{"host": host, "port": port}],
-        http_compress=True,
-        use_ssl=use_ssl,
-        verify_certs=False,
-        ssl_show_warn=False,
-        http_auth=auth,
-        timeout=60,
-        max_retries=3,
-        retry_on_timeout=True,
+with st.expander("⚠️ Sobre persistência no Streamlit Cloud", expanded=False):
+    st.markdown(
+        """
+- O Streamlit Community Cloud pode reiniciar o app e o filesystem pode ser limpo.
+- Para uso grande (120k docs), o ideal é **pré-gerar o índice** e hospedá-lo como arquivo (zip) no GitHub Releases/Storage,
+  e o app **baixar e abrir**.  
+- Este app já funciona para protótipo/uso por sessão e ingestões menores pela UI.
+"""
     )
 
-
-def ensure_index(client: OpenSearch, index_name: str) -> None:
-    if client.indices.exists(index=index_name):
-        return
-
-    body = {
-        "settings": {
-            "index": {
-                "number_of_shards": 1,
-                "number_of_replicas": 0,
-            }
-        },
-        "mappings": {
-            "properties": {
-                "doc_id": {"type": "keyword"},
-                "tipo_sigla": {"type": "keyword"},
-                "numero": {"type": "integer"},
-                "ano": {"type": "integer"},
-                "versao": {"type": "keyword"},   # Original | Consolidado
-                "url": {"type": "keyword"},
-                "texto": {"type": "text"},
-                "html": {"type": "text", "index": False},  # guardado, não indexado
-                "coletado_em": {"type": "date"},
-            }
-        },
-    }
-
-    client.indices.create(index=index_name, body=body)
-
-
-def bulk_index(client: OpenSearch, index_name: str, actions: list[dict]) -> tuple[int, int]:
-    """
-    Retorna (sucessos, falhas).
-    """
-    if not actions:
-        return 0, 0
-
-    success, errors = helpers.bulk(
-        client,
-        actions,
-        index=index_name,
-        request_timeout=180,
-        raise_on_error=False,
-        raise_on_exception=False,
-        chunk_size=500,
-    )
-    fail = len(errors) if isinstance(errors, list) else (0 if not errors else 1)
-    return int(success), int(fail)
-
-
 # =================================================
-# HTML EXTRACTION
+# HELPERS
 # =================================================
+def mkdirp(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
 def limpar_texto(texto: str) -> str:
     texto = re.sub(r"[ \t]+", " ", texto)
     texto = re.sub(r"\n{3,}", "\n\n", texto)
     return texto.strip()
 
-
-def extrair_texto_html(url: str) -> tuple[str, str]:
+# =================================================
+# HTML EXTRACTION (baseado no seu)
+# =================================================
+def extrair_texto_html(url: str) -> Tuple[str, str]:
     """
     Retorna (texto, html). Se falhar, texto começa com '❌' e html vem ''.
     """
@@ -133,15 +73,14 @@ def extrair_texto_html(url: str) -> tuple[str, str]:
         html = resp.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # Tentativa 1: span tradicional
+        # Tentativa 1: span tradicional usado por LEI/DEC
         span = soup.find("span", class_="js_interpretarLinks textNorma js_interpretarLinksDONE")
         if span:
-            texto = span.get_text(separator="\n", strip=True)
-            texto = limpar_texto(texto)
+            texto = limpar_texto(span.get_text(separator="\n", strip=True))
             if len(texto) > 50:
                 return texto, html
 
-        # Tentativa 2: <main>
+        # Tentativa 2: extrair do <main> (usado por DCS, DCE, etc.)
         main = soup.find("main")
         if main:
             for tag in main.find_all(["nav", "header", "footer", "script", "style", "button", "aside"]):
@@ -151,10 +90,8 @@ def extrair_texto_html(url: str) -> tuple[str, str]:
                 if "compartilhar" in div.get_text(strip=True).lower():
                     div.decompose()
 
-            texto = main.get_text(separator="\n", strip=True)
-            texto = limpar_texto(texto)
+            texto = limpar_texto(main.get_text(separator="\n", strip=True))
 
-            # Captura a partir de marcadores
             for marcador in ["DELIBERA", "RESOLVE", "Art. 1º", "Art. 1o", "Art. 1"]:
                 if marcador in texto:
                     return limpar_texto(marcador + "\n" + texto.split(marcador, 1)[-1]), html
@@ -166,110 +103,126 @@ def extrair_texto_html(url: str) -> tuple[str, str]:
     except Exception as e:
         return f"❌ Erro ao acessar: {str(e)}", ""
 
-
-def gerar_links(tipo: str, numero: str | int, ano: str | int) -> dict[str, str]:
+def gerar_links(tipo: str, numero: str | int, ano: str | int) -> Dict[str, str]:
     base = f"https://www.almg.gov.br/legislacao-mineira/texto/{tipo}/{numero}/{ano}"
     return {"Original": base + "/", "Consolidado": base + "/?cons=1"}
-
 
 def make_doc_id(tipo: str, numero: int, ano: int, versao: str) -> str:
     versao_slug = "orig" if versao.lower().startswith("orig") else "cons"
     return f"{tipo.upper()}_{numero}_{ano}_{versao_slug}"
 
-
-def doc_to_action(index_name: str, tipo: str, numero: int, ano: int, versao: str, url: str, texto: str, html: str) -> dict:
-    doc_id = make_doc_id(tipo, numero, ano, versao)
-    return {
-        "_index": index_name,
-        "_id": doc_id,
-        "_source": {
-            "doc_id": doc_id,
-            "tipo_sigla": tipo.upper(),
-            "numero": int(numero),
-            "ano": int(ano),
-            "versao": versao,
-            "url": url,
-            "texto": texto,
-            "html": html,
-            "coletado_em": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        },
-    }
-
-
 # =================================================
-# SEARCH
+# WHOOSH INDEX
 # =================================================
-def montar_query(expr_booleana: str, filtros: dict, size: int = 20, from_: int = 0) -> dict:
-    filter_clauses = []
+def get_schema() -> Schema:
+    # KEYWORD = exato (filtro). TEXT = full-text.
+    return Schema(
+        doc_id=ID(stored=True, unique=True),
+        tipo_sigla=KEYWORD(stored=True, commas=False, lowercase=False),
+        numero=NUMERIC(stored=True, numtype=int),
+        ano=NUMERIC(stored=True, numtype=int),
+        versao=KEYWORD(stored=True, commas=False, lowercase=False),
+        url=ID(stored=True),
+        texto=TEXT(stored=False),  # full-text
+        coletado_em=ID(stored=True),
+    )
 
-    # filtros por campo
+@st.cache_resource(show_spinner=False)
+def open_or_create_index(index_dir: str):
+    mkdirp(index_dir)
+    if index.exists_in(index_dir):
+        return index.open_dir(index_dir)
+    return index.create_in(index_dir, schema=get_schema())
+
+def add_documents(ix, docs: List[Dict]) -> Tuple[int, int]:
+    """
+    docs: lista de dicts com chaves do schema.
+    Retorna (ok, fail).
+    """
+    ok = 0
+    fail = 0
+    writer = ix.writer(limitmb=256, procs=1, multisegment=True)
+    try:
+        for d in docs:
+            try:
+                writer.update_document(**d)  # upsert por doc_id unique
+                ok += 1
+            except Exception:
+                fail += 1
+        writer.commit()
+    except Exception:
+        writer.cancel()
+        raise
+    return ok, fail
+
+def build_query(ix, expr: str, filtros: Dict) :
+    # Parser booleana em campos de texto (pode expandir para titulo etc.)
+    parser = MultifieldParser(["texto"], schema=ix.schema, group=OrGroup)
+    q_text = (expr or "").strip()
+
+    base_q = parser.parse(q_text) if q_text else Every()
+
+    filter_terms = []
     if filtros.get("tipo_sigla"):
-        filter_clauses.append({"term": {"tipo_sigla": str(filtros["tipo_sigla"]).upper()}})
+        filter_terms.append(Term("tipo_sigla", str(filtros["tipo_sigla"]).upper()))
     if filtros.get("versao"):
-        filter_clauses.append({"term": {"versao": str(filtros["versao"])}})
-
+        filter_terms.append(Term("versao", str(filtros["versao"])))
     if filtros.get("ano") not in (None, "", "Todos"):
-        filter_clauses.append({"term": {"ano": int(filtros["ano"])}})
-
+        filter_terms.append(Term("ano", int(filtros["ano"])))
     if filtros.get("numero") not in (None, "", "Todos"):
-        filter_clauses.append({"term": {"numero": int(filtros["numero"])}})
+        filter_terms.append(Term("numero", int(filtros["numero"])))
 
-    # query booleana
-    must_clause = []
-    expr_booleana = (expr_booleana or "").strip()
-    if expr_booleana:
-        must_clause.append(
-            {
-                "query_string": {
-                    "query": expr_booleana,
-                    "fields": ["texto"],
-                    "default_operator": "AND",
-                    "analyze_wildcard": True,
-                }
-            }
-        )
-    else:
-        must_clause.append({"match_all": {}})
+    if filter_terms:
+        return And([base_q] + filter_terms)
+    return base_q
 
-    return {
-        "query": {"bool": {"filter": filter_clauses, "must": must_clause}},
-        "highlight": {"fields": {"texto": {}}, "pre_tags": ["<mark>"], "post_tags": ["</mark>"]},
-        "size": int(size),
-        "from": int(from_),
-    }
-
+def search(ix, expr: str, filtros: Dict, limit: int = 20):
+    q = build_query(ix, expr, filtros)
+    with ix.searcher() as s:
+        results = s.search(q, limit=limit)
+        out = []
+        for r in results:
+            out.append({
+                "doc_id": r.get("doc_id"),
+                "tipo_sigla": r.get("tipo_sigla"),
+                "numero": r.get("numero"),
+                "ano": r.get("ano"),
+                "versao": r.get("versao"),
+                "url": r.get("url"),
+                "coletado_em": r.get("coletado_em"),
+                "score": float(r.score),
+            })
+        return out, results.scored_length()
 
 # =================================================
-# SIDEBAR - HELP
+# SIDEBAR
 # =================================================
 with st.sidebar:
     st.header("🧠 Sintaxe booleana")
     st.markdown(
         """
-Exemplos (campo livre):
+Exemplos:
 - `("transparência" OR publicidade) AND contrato`
 - `(licitação OR dispensa) AND NOT revogado`
 - `"Art. 1" AND (prazo OR vigência)`
 
-Filtros:
-- use os campos do formulário (tipo/ano/número/versão).
+Campos (filtros):
+- use os inputs de tipo/ano/número/versão.
 """
     )
-    st.header("🐳 OpenSearch via Docker (rápido)")
-    st.code(
-        """docker run -d --name opensearch \\
-  -p 9200:9200 -p 9600:9600 \\
-  -e "discovery.type=single-node" \\
-  -e "plugins.security.disabled=true" \\
-  opensearchproject/opensearch:2""",
-        language="bash",
-    )
+    st.header("⚙️ Índice local")
+    st.caption(f"Pasta do índice: `{INDEX_DIR}`")
 
+# =================================================
+# INIT INDEX
+# =================================================
+mkdirp(DATA_DIR)
+ix = open_or_create_index(INDEX_DIR)
 
 # =================================================
 # SECTION 1: UPLOAD + COLETA + INDEXAÇÃO
 # =================================================
-st.subheader("1) 📥 Upload → Coletar HTML → Indexar no OpenSearch")
+st.subheader("1) 📥 Upload → Coletar HTML → Indexar (Whoosh)")
 
 arquivo = st.file_uploader("Envie CSV ou Excel com colunas: tipo_sigla, numero, ano", type=["csv", "xlsx"])
 
@@ -302,32 +255,19 @@ if arquivo:
 
         if len(df_filtrado) > MAX_COLETA_UI:
             st.warning(
-                f"⚠️ Limite temporário na interface: selecione até {MAX_COLETA_UI} normas por vez."
-                " (Para carga grande, use um script de ingestão em lote.)"
+                f"⚠️ Limite no Streamlit Cloud: selecione até {MAX_COLETA_UI} normas por vez."
+                " (Para carga grande, pré-gere o índice fora do Cloud e publique o índice pronto.)"
             )
             st.stop()
 
-        colA, colB, colC = st.columns(3)
+        colA, colB = st.columns(2)
         coletar_original = colA.checkbox("Coletar versão Original", value=True)
         coletar_consolidado = colB.checkbox("Coletar versão Consolidado", value=True)
-        salvar_html = colC.checkbox("Guardar HTML (não indexa)", value=False)
 
         if st.button("🚀 Coletar e indexar"):
-            host = st.session_state["cfg_host"]
-            port = int(st.session_state["cfg_port"])
-            index_name = st.session_state["cfg_index"]
-            use_ssl = bool(st.session_state["cfg_ssl"])
-
-            client = get_client(host, port, use_ssl, OPENSEARCH_USER, OPENSEARCH_PASS)
-            try:
-                ensure_index(client, index_name)
-            except Exception as e:
-                st.error(f"Não consegui criar/verificar o índice '{index_name}': {e}")
-                st.stop()
-
             st.info("🔄 Coletando e indexando…")
             resultados = []
-            actions = []
+            docs_index = []
 
             barra = st.progress(0)
             total = len(df_filtrado)
@@ -345,33 +285,29 @@ if arquivo:
                     versoes.append(("Consolidado", links["Consolidado"]))
 
                 for versao, url in versoes:
-                    texto, html = extrair_texto_html(url)
+                    texto, _html = extrair_texto_html(url)
 
-                    resultados.append(
-                        {
-                            "tipo_sigla": tipo,
+                    resultados.append({
+                        "tipo_sigla": tipo,
+                        "numero": numero,
+                        "ano": ano,
+                        "versao": versao,
+                        "url": url,
+                        "texto": texto,
+                    })
+
+                    # indexa somente se texto válido
+                    if texto and not texto.startswith("❌") and len(texto) > 50:
+                        docs_index.append({
+                            "doc_id": make_doc_id(tipo, numero, ano, versao),
+                            "tipo_sigla": tipo.upper(),
                             "numero": numero,
                             "ano": ano,
                             "versao": versao,
                             "url": url,
                             "texto": texto,
-                        }
-                    )
-
-                    # Só indexa se não for erro e tiver conteúdo mínimo
-                    if texto and not texto.startswith("❌") and len(texto) > 50:
-                        actions.append(
-                            doc_to_action(
-                                index_name=index_name,
-                                tipo=tipo,
-                                numero=numero,
-                                ano=ano,
-                                versao=versao,
-                                url=url,
-                                texto=texto,
-                                html=(html if salvar_html else ""),
-                            )
-                        )
+                            "coletado_em": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        })
 
                 barra.progress(j / total)
 
@@ -379,9 +315,8 @@ if arquivo:
             st.success("✅ Coleta finalizada!")
             st.dataframe(df_resultado.head(50), use_container_width=True)
 
-            # Bulk index
-            with st.spinner("Indexando no OpenSearch (bulk)…"):
-                ok, fail = bulk_index(client, index_name, actions)
+            with st.spinner("Indexando (Whoosh)…"):
+                ok, fail = add_documents(ix, docs_index)
 
             st.success(f"📌 Indexação concluída: {ok} docs OK | {fail} falhas")
 
@@ -400,21 +335,14 @@ st.divider()
 # =================================================
 # SECTION 2: BUSCA
 # =================================================
-st.subheader("2) 🔎 Buscar no índice (OpenSearch)")
-
-host = st.session_state["cfg_host"]
-port = int(st.session_state["cfg_port"])
-index_name = st.session_state["cfg_index"]
-use_ssl = bool(st.session_state["cfg_ssl"])
+st.subheader("2) 🔎 Buscar no índice (Booleano + campos)")
 
 col1, col2 = st.columns([2, 1])
 expr = col1.text_input(
     "Busca booleana (AND/OR/NOT, parênteses, aspas)",
     value='("transparência" OR publicidade) AND contrato',
 )
-
-with col2:
-    size = st.number_input("Qtde de resultados", min_value=5, max_value=100, value=20, step=5)
+limit = col2.number_input("Qtde de resultados", min_value=5, max_value=100, value=20, step=5)
 
 f1, f2, f3, f4 = st.columns(4)
 f_tipo = f1.text_input("tipo_sigla (ex.: LEI, DEC)", value="")
@@ -422,66 +350,26 @@ f_ano = f2.text_input("ano (opcional)", value="")
 f_num = f3.text_input("numero (opcional)", value="")
 f_versao = f4.selectbox("versao", ["", "Original", "Consolidado"], index=0)
 
-# paginação simples
-pcol1, pcol2, _ = st.columns([1, 1, 2])
-if "page" not in st.session_state:
-    st.session_state["page"] = 1
-
-if pcol1.button("⬅️ Página anterior"):
-    st.session_state["page"] = max(1, st.session_state["page"] - 1)
-
-if pcol2.button("➡️ Próxima página"):
-    st.session_state["page"] += 1
-
-from_ = (st.session_state["page"] - 1) * int(size)
-st.caption(f"Página atual: {st.session_state['page']} (offset={from_})")
-
 if st.button("Buscar"):
-    client = get_client(host, port, use_ssl, OPENSEARCH_USER, OPENSEARCH_PASS)
+    filtros = {
+        "tipo_sigla": f_tipo.strip(),
+        "ano": f_ano.strip(),
+        "numero": f_num.strip(),
+        "versao": f_versao.strip(),
+    }
 
     try:
-        if not client.indices.exists(index=index_name):
-            st.error(f"Índice '{index_name}' não existe. Faça a coleta/indexação ou crie o índice.")
-            st.stop()
+        hits, total = search(ix, expr, filtros, limit=int(limit))
     except Exception as e:
-        st.error(f"Erro ao acessar OpenSearch: {e}")
+        st.error(f"Erro na busca (sintaxe/consulta): {e}")
         st.stop()
 
-    filtros = {"tipo_sigla": f_tipo.strip(), "ano": f_ano.strip(), "numero": f_num.strip(), "versao": f_versao.strip()}
-    body = montar_query(expr, filtros, size=size, from_=from_)
-
-    try:
-        resp = client.search(index=index_name, body=body)
-    except Exception as e:
-        st.error(f"Erro na busca: {e}")
-        st.stop()
-
-    hits = resp.get("hits", {}).get("hits", [])
-    total = resp.get("hits", {}).get("total", {})
-    total_val = total.get("value", total) if isinstance(total, dict) else total
-
-    st.success(f"Resultados retornados: {len(hits)} | Total estimado: {total_val}")
+    st.success(f"Resultados retornados: {len(hits)}")
 
     for h in hits:
-        src = h.get("_source", {})
-        score = h.get("_score", 0)
-
-        meta = f"{src.get('tipo_sigla')} {src.get('numero')}/{src.get('ano')} — {src.get('versao')}"
+        meta = f"{h.get('tipo_sigla')} {h.get('numero')}/{h.get('ano')} — {h.get('versao')}"
         st.markdown(f"### {meta}")
-        st.caption(f"doc_id: {src.get('doc_id')} | score: {score:.3f}")
-        if src.get("url"):
-            st.markdown(src["url"])
-
-        trecho = ""
-        hl = h.get("highlight", {}).get("texto")
-        if hl:
-            trecho = hl[0]
-
-        if trecho:
-            st.markdown(trecho, unsafe_allow_html=True)
-        else:
-            # fallback
-            texto = src.get("texto", "")
-            st.write(texto[:600] + ("…" if len(texto) > 600 else ""))
-
+        st.caption(f"doc_id: {h.get('doc_id')} | score: {h.get('score'):.3f} | coletado_em: {h.get('coletado_em')}")
+        if h.get("url"):
+            st.markdown(h["url"])
         st.divider()
