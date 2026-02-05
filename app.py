@@ -1,90 +1,98 @@
 import streamlit as st
 import pandas as pd
 import requests
+import time
 from io import BytesIO
 
-st.set_page_config(page_title="Coletor Automático de Textos da ALMG", layout="wide")
-st.title("📄 Coletor Automático de Normas da ALMG")
-st.markdown("1. Digite o ano desejado  \n2. O app buscará todas as normas publicadas nesse ano  \n3. Os textos serão extraídos via API oficial da ALMG")
+# -------------------------------
+# CONFIGURAÇÃO INICIAL DO APP
+# -------------------------------
+st.set_page_config(page_title="Coletor de Textos da ALMG", layout="wide")
+st.title("📄 Coletor de Textos das Normas da ALMG")
+st.markdown("Este app consulta a [API da ALMG](https://dadosabertos.almg.gov.br) para buscar textos oficiais de normas por ano.\n\n> **Atenção:** o processo é lento pois respeita limites de acesso da API.")
 
-# ---------------------------
-# Função para extrair texto via API
-# ---------------------------
-def extrair_texto_api(tipo, numero, ano, versao):
+# -------------------------------
+# FUNÇÃO PARA BUSCAR LISTA DE NORMAS
+# -------------------------------
+@st.cache_data(show_spinner=False)
+def buscar_normas_do_ano(ano):
     try:
-        tipo_doc = 142 if versao == "Original" else 572
-        url = f"https://dadosabertos.almg.gov.br/api/v2/legislacao/mineira/{tipo}/{numero}/{ano}/documento"
-        params = {
-            "conteudo": "true",
-            "texto": "false",
-            "tipoDoc": tipo_doc
-        }
-        headers = {"accept": "application/json"}
-        r = requests.get(url, params=params, headers=headers, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("conteudo", "").strip()
-    except:
-        return ""  # Se der erro, retorna texto vazio
-
-# ---------------------------
-# Função para buscar lista de normas por ano
-# ---------------------------
-def obter_normas_por_ano(ano):
-    url = f"https://dadosabertos.almg.gov.br/arquivos/legislacao-mineira/{ano}.csv"
-    try:
-        df = pd.read_csv(url, sep=";", encoding="utf-8")
-        df = df[["tipo", "numero", "ano"]].dropna().drop_duplicates()
-        df.columns = ["tipo_sigla", "numero", "ano"]
-        return df
+        url = f"https://dadosabertos.almg.gov.br/api/v2/legislacaoNorma?formato=json&ano={ano}"
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        st.error(f"Erro ao baixar normas do ano {ano}: {e}")
-        return pd.DataFrame()
+        st.error(f"Erro ao buscar normas do ano {ano}: {e}")
+        return []
 
-# ---------------------------
-# Interface Streamlit
-# ---------------------------
-ano_desejado = st.text_input("📅 Digite o ano desejado", placeholder="Ex: 2025")
+# -------------------------------
+# FUNÇÃO PARA BUSCAR TEXTO DE UMA NORMA
+# -------------------------------
+def buscar_texto_da_norma(tipo, numero, ano, tipo_doc):
+    base_url = f"https://dadosabertos.almg.gov.br/api/v2/legislacao/mineira/{tipo}/{numero}/{ano}/documento"
+    params = {
+        "conteudo": "true",
+        "texto": "true",
+        "tipoDoc": tipo_doc  # 142 = original, 572 = consolidado
+    }
+    try:
+        r = requests.get(base_url, params=params, timeout=30)
+        r.raise_for_status()
+        dados = r.json()
+        if dados and isinstance(dados, list) and "conteudo" in dados[0]:
+            return dados[0]["conteudo"]
+        else:
+            return ""
+    except:
+        return ""
 
-if ano_desejado:
-    if st.button("🔎 Buscar normas"):
-        st.info(f"Buscando normas publicadas em {ano_desejado}…")
-        df_normas = obter_normas_por_ano(ano_desejado)
+# -------------------------------
+# ENTRADA DO USUÁRIO
+# -------------------------------
+ano = st.text_input("📅 Digite o ano desejado", value="2026")
+if st.button("🔍 Buscar normas"):
+    if not ano.isdigit():
+        st.error("Ano inválido.")
+        st.stop()
 
-        if df_normas.empty:
-            st.warning("⚠️ Nenhuma norma encontrada para o ano informado.")
-            st.stop()
+    st.info(f"📥 Buscando normas publicadas em {ano}…")
+    normas = buscar_normas_do_ano(ano)
 
-        st.success(f"✅ {len(df_normas)} normas encontradas para {ano_desejado}. Iniciando coleta dos textos…")
+    if not normas:
+        st.warning("⚠️ Nenhuma norma encontrada para o ano informado.")
+        st.stop()
 
-        resultados = []
-        barra = st.progress(0)
+    st.success(f"✅ {len(normas)} normas encontradas.")
+    progresso = st.progress(0)
+    resultados = []
 
-        for i, row in df_normas.iterrows():
-            tipo, numero, ano = row["tipo_sigla"], row["numero"], row["ano"]
+    for i, norma in enumerate(normas):
+        tipo = norma.get("tipo", "").strip()
+        numero = norma.get("numero")
+        ano_norma = norma.get("ano")
 
-            for versao in ["Original", "Consolidado"]:
-                texto = extrair_texto_api(tipo, numero, ano, versao)
-                resultados.append({
-                    "tipo_sigla": tipo,
-                    "numero": numero,
-                    "ano": ano,
-                    "versao": versao,
-                    "texto": texto
-                })
+        # Pega textos original e consolidado com pausa entre requisições
+        texto_original = buscar_texto_da_norma(tipo, numero, ano_norma, tipo_doc=142)
+        time.sleep(1.5)  # espera para evitar bloqueio
 
-            barra.progress((i + 1) / len(df_normas))
+        texto_consolidado = buscar_texto_da_norma(tipo, numero, ano_norma, tipo_doc=572)
+        time.sleep(1.5)  # espera para evitar bloqueio
 
-        df_resultado = pd.DataFrame(resultados)
-        st.success("✅ Coleta concluída!")
-        st.dataframe(df_resultado.head(50))
+        resultados.append({
+            "tipo_sigla": tipo,
+            "numero": numero,
+            "ano": ano_norma,
+            "texto_original": texto_original.strip(),
+            "texto_consolidado": texto_consolidado.strip()
+        })
 
-        # Exportar como CSV
-        buffer = BytesIO()
-        df_resultado.to_csv(buffer, index=False, encoding="utf-8-sig")
-        st.download_button(
-            label="⬇️ Baixar CSV com os textos",
-            data=buffer.getvalue(),
-            file_name=f"textos_normas_{ano_desejado}.csv",
-            mime="text/csv"
-        )
+        progresso.progress((i + 1) / len(normas))
+
+    df_resultado = pd.DataFrame(resultados)
+    st.dataframe(df_resultado.head(10))
+
+    # Baixar CSV
+    buffer = BytesIO()
+    df_resultado.to_csv(buffer, index=False, encoding="utf-8-sig")
+    st.download_button("⬇️ Baixar CSV com os textos", data=buffer.getvalue(),
+                       file_name=f"normas_{ano}.csv", mime="text/csv")
