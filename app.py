@@ -1,8 +1,6 @@
 import os
 import io
-import re
 import json
-import time
 import zipfile
 import hashlib
 from datetime import datetime
@@ -18,16 +16,8 @@ from whoosh.query import And, Term, Every
 
 
 # =================================================
-# CONFIG BÁSICA (AJUSTE AQUI)
+# CONFIG BÁSICA
 # =================================================
-# Preferência: configurar via Streamlit Secrets:
-# [github]
-# owner="..."
-# repo="..."
-# token="..."  (opcional, ajuda com rate limit)
-#
-# Alternativa: variáveis de ambiente GITHUB_OWNER / GITHUB_REPO / GITHUB_TOKEN
-
 def _get_secret(path: List[str], default: str = "") -> str:
     cur = st.secrets
     try:
@@ -41,11 +31,12 @@ def _get_secret(path: List[str], default: str = "") -> str:
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", _get_secret(["github", "owner"], ""))
 GITHUB_REPO = os.getenv("GITHUB_REPO", _get_secret(["github", "repo"], ""))
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", _get_secret(["github", "token"], ""))  # opcional
+RELEASE_TAG = os.getenv("RELEASE_TAG", _get_secret(["github", "tag"], "index-latest"))
 
-ASSET_NAME = os.getenv("INDEX_ASSET_NAME", "index.zip")  # nome do asset no Release
+ASSET_NAME = os.getenv("INDEX_ASSET_NAME", "index.zip")
+
 DATA_DIR = "data"
 INDEX_DIR = os.path.join(DATA_DIR, "index")
-STATE_PATH = os.path.join(DATA_DIR, "state.json")
 META_PATH = os.path.join(DATA_DIR, "release_meta.json")
 
 REQUEST_TIMEOUT = 30
@@ -55,8 +46,10 @@ REQUEST_TIMEOUT = 30
 # STREAMLIT UI
 # =================================================
 st.set_page_config(page_title="Motor de Busca ALMG (Index Release)", layout="wide")
-st.title("📚 Motor de Busca ALMG — Release Index (Whoosh)")
-st.caption("O app baixa o índice pronto (index.zip) do Release 'latest' no GitHub e serve busca booleana com campos.")
+st.title("📚 Motor de Busca ALMG — Índice via Release (Whoosh)")
+st.caption(
+    "O app baixa o índice pronto (index.zip) do Release do GitHub (tag fixa) e serve busca booleana com filtros."
+)
 
 
 # =================================================
@@ -92,15 +85,13 @@ def save_json(path: str, data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-def clean_extract_zip(zip_bytes: bytes, dest_dir: str) -> None:
+def clean_extract_zip(zip_bytes: bytes) -> None:
     """
     Extrai zip com proteção básica contra Zip Slip.
-    Espera que o zip contenha algo como: data/index/... e data/state.json
+    Espera que o zip contenha algo como: data/index/... e (opcionalmente) data/state.json
     """
-    mkdirp(dest_dir)
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         for member in z.infolist():
-            # bloqueia paths maliciosos
             member_path = member.filename.replace("\\", "/")
             if member_path.startswith("/") or ".." in member_path.split("/"):
                 continue
@@ -108,7 +99,7 @@ def clean_extract_zip(zip_bytes: bytes, dest_dir: str) -> None:
 
 
 # =================================================
-# GITHUB RELEASE (latest) - FETCH
+# GITHUB RELEASE - FETCH POR TAG (index-latest)
 # =================================================
 def github_headers() -> Dict[str, str]:
     h = {
@@ -119,10 +110,8 @@ def github_headers() -> Dict[str, str]:
         h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return h
 
-def fetch_latest_release_info(owner: str, repo: str) -> dict:
-    TAG = os.getenv("RELEASE_TAG", _get_secret(["github", "tag"], "index-latest"))
-url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{TAG}"
-
+def fetch_release_info_by_tag(owner: str, repo: str, tag: str) -> dict:
+    url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
     r = requests.get(url, headers=github_headers(), timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
@@ -134,21 +123,21 @@ def pick_asset(release_json: dict, asset_name: str) -> Optional[dict]:
     return None
 
 def download_asset_bytes(asset: dict) -> bytes:
-    """
-    Baixa asset usando browser_download_url (público).
-    Se o repo for privado, precisa token e usar asset API. Aqui assumo repo público.
-    """
     url = asset.get("browser_download_url")
     if not url:
         raise RuntimeError("Asset não tem browser_download_url.")
+    # download público; se repo for privado, você precisará mudar para API de asset com token
     r = requests.get(url, headers={"User-Agent": "streamlit-almg-search"}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.content
 
+def index_is_ready() -> bool:
+    return dir_exists(INDEX_DIR) and index.exists_in(INDEX_DIR)
+
 def current_local_release_meta() -> dict:
     return load_json(META_PATH, default={})
 
-def should_download_new_release(remote_release: dict, local_meta: dict) -> bool:
+def should_download(remote_release: dict, local_meta: dict) -> bool:
     remote_id = remote_release.get("id")
     local_id = local_meta.get("release_id")
     return (remote_id is not None) and (remote_id != local_id)
@@ -165,14 +154,11 @@ def save_local_release_meta(remote_release: dict, zip_hash: str) -> None:
     mkdirp(DATA_DIR)
     save_json(META_PATH, meta)
 
-def index_is_ready() -> bool:
-    return dir_exists(INDEX_DIR) and index.exists_in(INDEX_DIR)
 
 # =================================================
 # WHOOSH
 # =================================================
 def get_schema() -> Schema:
-    # Só pra fallback de criação (não deve acontecer se você sempre baixar o index.zip)
     return Schema(
         doc_id=ID(stored=True, unique=True),
         tipo_sigla=KEYWORD(stored=True, commas=False, lowercase=False),
@@ -189,11 +175,8 @@ def get_schema() -> Schema:
 
 @st.cache_resource(show_spinner=False)
 def open_index_cached(index_dir: str):
-    # cache do objeto índice; se você atualizar o índice no disco,
-    # chame st.cache_resource.clear() antes de reabrir
     if index.exists_in(index_dir):
         return index.open_dir(index_dir)
-    # fallback: cria vazio (não recomendado, mas evita crash)
     mkdirp(index_dir)
     return index.create_in(index_dir, get_schema())
 
@@ -236,66 +219,54 @@ def search(ix, expr: str, filtros: Dict, limit: int = 20):
 
 
 # =================================================
-# BOOTSTRAP / UPDATE INDEX FROM RELEASE
+# BAIXAR/ATUALIZAR ÍNDICE DO RELEASE
 # =================================================
 def ensure_index_from_release(force: bool = False) -> Tuple[bool, str]:
-    """
-    Garante que existe índice local, baixando o release latest se necessário.
-    Retorna (ok, mensagem).
-    """
     if not GITHUB_OWNER or not GITHUB_REPO:
-        return False, "Configure GITHUB_OWNER e GITHUB_REPO (secrets ou env)."
+        return False, "Configure owner/repo nos Secrets do Streamlit ([github] owner=... repo=...)."
 
     mkdirp(DATA_DIR)
-
     local_meta = current_local_release_meta()
 
     try:
-        release = fetch_latest_release_info(GITHUB_OWNER, GITHUB_REPO)
+        release = fetch_release_info_by_tag(GITHUB_OWNER, GITHUB_REPO, RELEASE_TAG)
     except Exception as e:
-        # Se já existe índice local, segue com ele
         if index_is_ready():
-            return True, f"Não consegui consultar Release latest, usando índice local. Erro: {e}"
-        return False, f"Falha ao consultar Release latest: {e}"
+            return True, f"Não consegui consultar Release (tag {RELEASE_TAG}), usando índice local. Erro: {e}"
+        return False, f"Falha ao consultar Release (tag {RELEASE_TAG}): {e}"
 
     asset = pick_asset(release, ASSET_NAME)
     if not asset:
-        return False, f"Release latest encontrado, mas não achei asset '{ASSET_NAME}'."
+        return False, f"Release (tag {RELEASE_TAG}) encontrado, mas não achei asset '{ASSET_NAME}'."
 
-    need_download = force or (not index_is_ready()) or should_download_new_release(release, local_meta)
+    need = force or (not index_is_ready()) or should_download(release, local_meta)
+    if not need:
+        return True, "Índice local já está atualizado."
 
-    if not need_download:
-        return True, "Índice local já está atualizado com o Release latest."
-
-    # Download + extract
     try:
         zip_bytes = download_asset_bytes(asset)
         zhash = sha256_bytes(zip_bytes)
+        clean_extract_zip(zip_bytes)
 
-        # Extrai: o zip deve conter pasta data/index e data/state.json
-        clean_extract_zip(zip_bytes, dest_dir=".")
-
-        # valida
         if not index_is_ready():
-            return False, "Baixei e extraí o zip, mas não encontrei um índice Whoosh válido em data/index."
+            return False, "Baixei e extraí, mas não encontrei um índice Whoosh válido em data/index."
 
         save_local_release_meta(release, zhash)
-        return True, "Índice atualizado a partir do Release latest."
+        return True, "Índice atualizado a partir do Release."
     except Exception as e:
-        # se já havia índice, usa o existente
         if index_is_ready():
             return True, f"Falha ao atualizar, usando índice local existente. Erro: {e}"
         return False, f"Falha ao baixar/extrair index.zip: {e}"
 
 
 # =================================================
-# SIDEBAR: STATUS + UPDATE
+# SIDEBAR
 # =================================================
 with st.sidebar:
-    st.header("⚙️ Fonte do índice")
+    st.header("⚙️ Fonte do índice (GitHub Release)")
     st.write(f"Repo: **{GITHUB_OWNER}/{GITHUB_REPO}**" if (GITHUB_OWNER and GITHUB_REPO) else "Repo: **(não configurado)**")
+    st.write(f"Tag do Release: **{RELEASE_TAG}**")
     st.write(f"Asset esperado: **{ASSET_NAME}**")
-    st.caption("Se o repo for público, não precisa token. Se privado, use token em secrets.")
 
     local_meta = current_local_release_meta()
     if local_meta:
@@ -306,37 +277,28 @@ with st.sidebar:
     auto_on_start = colA.checkbox("Baixar ao abrir", value=True)
     force_update_btn = colB.button("Atualizar índice agora")
 
-# Baixa (ou confirma) índice
 if auto_on_start and "bootstrapped" not in st.session_state:
     st.session_state["bootstrapped"] = True
-    with st.spinner("Verificando/baixando índice do Release latest…"):
+    with st.spinner("Verificando/baixando índice do Release…"):
         ok, msg = ensure_index_from_release(force=False)
-    if ok:
-        st.success(msg)
-    else:
-        st.error(msg)
+    st.success(msg) if ok else st.error(msg)
 
 if force_update_btn:
     with st.spinner("Forçando atualização do índice…"):
         ok, msg = ensure_index_from_release(force=True)
-        # índice mudou em disco -> limpa cache do open_index
         st.cache_resource.clear()
-    if ok:
-        st.success(msg)
-    else:
-        st.error(msg)
+    st.success(msg) if ok else st.error(msg)
 
-# Abre índice (mesmo se não baixou — pode existir localmente)
 ix = open_index_cached(INDEX_DIR)
 
-# mostra métricas
 try:
     st.sidebar.metric("Docs no índice", count_docs(ix))
 except Exception:
     st.sidebar.metric("Docs no índice", 0)
 
+
 # =================================================
-# SEARCH UI
+# BUSCA
 # =================================================
 st.subheader("🔎 Buscar no índice (booleana + campos)")
 
@@ -353,8 +315,7 @@ f_ano = f2.text_input("ano (opcional)", value="")
 f_num = f3.text_input("numero (opcional)", value="")
 f_versao = f4.selectbox("versao (opcional)", ["", "Original", "Consolidado"], index=0)
 
-# Dica de uso: não filtrar por ano sem querer
-st.caption("Dica: deixe filtros vazios para buscar no acervo inteiro. Preencha apenas se quiser restringir.")
+st.caption("Dica: deixe filtros vazios para buscar no acervo inteiro.")
 
 if st.button("Buscar"):
     filtros = {
@@ -364,7 +325,6 @@ if st.button("Buscar"):
         "versao": f_versao.strip(),
     }
 
-    # valida números
     if filtros["ano"] and not filtros["ano"].isdigit():
         st.error("O campo 'ano' deve ser numérico (ou vazio).")
         st.stop()
@@ -382,7 +342,9 @@ if st.button("Buscar"):
     for h in hits:
         meta = f"{h.get('tipo_sigla')} {h.get('numero')}/{h.get('ano')} — {h.get('versao')}"
         st.markdown(f"### {meta}")
-        st.caption(f"doc_id: {h.get('doc_id')} | score: {h.get('score'):.3f} | coletado_em: {h.get('coletado_em')}")
+        st.caption(
+            f"doc_id: {h.get('doc_id')} | score: {h.get('score'):.3f} | coletado_em: {h.get('coletado_em')}"
+        )
         if h.get("url"):
             st.markdown(h["url"])
         st.divider()
