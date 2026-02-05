@@ -2,10 +2,10 @@ import os
 import re
 import time
 import glob
-import json
 import hashlib
 from datetime import datetime
 from io import BytesIO
+from typing import List, Tuple
 
 import pandas as pd
 import requests
@@ -16,20 +16,25 @@ from bs4 import BeautifulSoup
 # =================================================
 # CONFIG
 # =================================================
-st.set_page_config(page_title="Coletor ALMG (CSV por ano + API)", layout="wide")
+st.set_page_config(page_title="Coletor ALMG (CSV por ano + links)", layout="wide")
 st.title("📄 Coletor de Textos — ALMG (CSV por ano no GitHub)")
-st.caption("Lê automaticamente os CSVs do repositório (LegislacaoMineira_YYYY.csv), baixa textos via API (142/572) e gera uma tabela final com links + textos.")
+st.caption("Lê automaticamente LegislacaoMineira_YYYY.csv do repositório, usa LinkTextoOriginal/LinkTextoAtualizado para baixar textos e gera CSV final com textos.")
 
-DATA_DIR = "data_csv"   # pasta no repo
-FILE_PATTERN = os.path.join(DATA_DIR, "LegislacaoMineira_*.csv*")  # aceita .csv e .csv.gz
-
-API_ORIGINAL = 142
-API_ATUALIZADO = 572
+DATA_DIR = "data_csv"
+FILE_PATTERN = os.path.join(DATA_DIR, "LegislacaoMineira_*.csv*")  # .csv ou .csv.gz
 
 REQUEST_TIMEOUT = 30
-MIN_INTERVAL_SECONDS = 1.0  # respeitar 1 req/s (dados abertos)
+MIN_INTERVAL_SECONDS = 1.0  # respeitar 1 req/s
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "streamlit-almg-coletor/1.0"})
+
+# Colunas do seu CSV
+COL_TIPO = "Tipo"
+COL_NUMERO = "Numero"
+COL_ANO = "Ano"
+COL_LINK_ORIG = "LinkTextoOriginal"
+COL_LINK_ATU = "LinkTextoAtualizado"
 
 
 # =================================================
@@ -49,13 +54,9 @@ def limpar_texto(texto: str) -> str:
 def url_portal(tipo: str, numero: int, ano: int) -> str:
     return f"https://www.almg.gov.br/legislacao-mineira/texto/{tipo}/{numero}/{ano}/"
 
-def url_api(tipo: str, numero: int, ano: int, tipo_doc: int) -> str:
-    return f"https://dadosabertos.almg.gov.br/api/v2/legislacao/mineira/{tipo}/{numero}/{ano}/documento?conteudo=true&tipoDoc={tipo_doc}"
-
 _last_req_ts = 0.0
 def rate_limited_get(url: str) -> requests.Response:
     global _last_req_ts
-    # garante intervalo mínimo entre o fim de uma e o início da outra (regra 1 req/s)
     elapsed = time.time() - _last_req_ts
     if elapsed < MIN_INTERVAL_SECONDS:
         time.sleep(MIN_INTERVAL_SECONDS - elapsed)
@@ -63,20 +64,21 @@ def rate_limited_get(url: str) -> requests.Response:
     _last_req_ts = time.time()
     return resp
 
-def parse_api_text(resp_json: dict) -> str:
+def parse_api_text(resp_json) -> str:
     """
-    A API pode devolver o conteúdo em chaves diferentes dependendo do endpoint/versão.
-    Então tentamos várias possibilidades.
+    Tenta extrair o conteúdo de vários formatos possíveis.
     """
+    if isinstance(resp_json, str) and len(resp_json.strip()) > 20:
+        return resp_json.strip()
+
     if not isinstance(resp_json, dict):
         return ""
-    # tentativas comuns
+
     for key in ["conteudo", "content", "texto", "html", "documento", "body"]:
         v = resp_json.get(key)
         if isinstance(v, str) and len(v.strip()) > 20:
             return v.strip()
 
-    # às vezes vem aninhado
     for key in ["dados", "data", "item", "resultado", "result"]:
         v = resp_json.get(key)
         if isinstance(v, dict):
@@ -84,58 +86,68 @@ def parse_api_text(resp_json: dict) -> str:
             if t:
                 return t
 
-    # arrays
     for key in ["itens", "items", "resultados", "results"]:
         arr = resp_json.get(key)
-        if isinstance(arr, list) and arr:
+        if isinstance(arr, list):
             for el in arr:
                 if isinstance(el, dict):
                     t = parse_api_text(el)
                     if t:
                         return t
-
     return ""
 
 def strip_html_if_needed(texto: str) -> str:
-    """
-    Se a API devolver HTML, converte para texto simples (mantendo quebras).
-    Se já for texto, retorna igual.
-    """
     if not texto:
         return ""
-    # Heurística simples: tem tags?
     if "<" in texto and ">" in texto:
         soup = BeautifulSoup(texto, "html.parser")
         return limpar_texto(soup.get_text("\n", strip=True))
     return limpar_texto(texto)
 
-def fetch_texto_api(tipo: str, numero: int, ano: int, tipo_doc: int) -> tuple[str, int, str]:
+def fetch_texto_por_link(url: str) -> Tuple[str, int]:
     """
-    Retorna (texto, status_code, url)
+    Baixa texto a partir do link fornecido no CSV.
+    Pode ser API (JSON) ou HTML.
     """
-    u = url_api(tipo, numero, ano, tipo_doc)
+    if not url or not isinstance(url, str):
+        return "", 0
+
     try:
-        r = rate_limited_get(u)
+        r = rate_limited_get(url)
         status = r.status_code
         if status != 200:
-            return "", status, u
-        j = r.json()
-        raw = parse_api_text(j)
-        txt = strip_html_if_needed(raw)
-        return txt, status, u
+            return "", status
+
+        ctype = (r.headers.get("Content-Type") or "").lower()
+
+        # Se vier JSON
+        if "application/json" in ctype or url.lower().endswith(".json") or "api/" in url.lower():
+            j = r.json()
+            raw = parse_api_text(j)
+            return strip_html_if_needed(raw), status
+
+        # Se vier HTML direto
+        html = r.text or ""
+        soup = BeautifulSoup(html, "html.parser")
+        # tenta extrair texto principal
+        main = soup.find("main") or soup
+        for tag in main.find_all(["nav", "header", "footer", "script", "style", "button", "aside"]):
+            tag.decompose()
+        txt = limpar_texto(main.get_text("\n", strip=True))
+        return txt, status
+
     except Exception:
-        return "", 0, u
+        return "", 0
 
 
 # =================================================
-# CARREGAR CSVs DO REPO
+# ARQUIVOS NO REPO
 # =================================================
 @st.cache_data(show_spinner=False)
-def list_year_files():
+def list_year_files() -> List[Tuple[int, str]]:
     files = sorted(glob.glob(FILE_PATTERN))
     out = []
     for f in files:
-        # extrai YYYY do nome
         m = re.search(r"LegislacaoMineira_(\d{4})\.csv(\.gz)?$", os.path.basename(f))
         if m:
             out.append((int(m.group(1)), f))
@@ -145,109 +157,104 @@ def list_year_files():
 @st.cache_data(show_spinner=False)
 def load_year_csv(path: str) -> pd.DataFrame:
     if path.endswith(".gz"):
-        df = pd.read_csv(path, compression="gzip")
-    else:
-        df = pd.read_csv(path)
-    return df
+        return pd.read_csv(path, compression="gzip")
+    return pd.read_csv(path)
 
 
-# =================================================
-# UI: selecionar anos e carregar base
-# =================================================
 year_files = list_year_files()
 if not year_files:
-    st.error(f"Não encontrei arquivos em `{DATA_DIR}` com o padrão `LegislacaoMineira_YYYY.csv`. Crie a pasta e suba os arquivos no repo.")
+    st.error(f"Não encontrei arquivos em `{DATA_DIR}` com o padrão `LegislacaoMineira_YYYY.csv`.")
     st.stop()
 
 anos_disponiveis = [y for y, _ in year_files]
 map_ano_arquivo = {y: p for y, p in year_files}
 
-colA, colB = st.columns([2, 1])
-anos_sel = colA.multiselect("📅 Selecione ano(s) para carregar", options=anos_disponiveis, default=[anos_disponiveis[0]])
-somente_amostra = colB.checkbox("Usar amostra (debug)", value=False, help="Carrega e processa só as primeiras 30 linhas para teste rápido.")
-
+anos_sel = st.multiselect("📅 Selecione ano(s) para carregar", options=anos_disponiveis, default=[anos_disponiveis[0]])
 if not anos_sel:
     st.stop()
 
-dfs = []
-for a in anos_sel:
-    df = load_year_csv(map_ano_arquivo[a])
-    dfs.append(df)
-
+dfs = [load_year_csv(map_ano_arquivo[a]) for a in anos_sel]
 base = pd.concat(dfs, ignore_index=True)
 
-# normalização mínima
-needed = {"tipo_sigla", "numero", "ano"}
-if not needed.issubset(set(base.columns)):
-    st.error(f"Os CSVs precisam ter pelo menos estas colunas: {sorted(list(needed))}")
+# valida colunas
+needed = {COL_TIPO, COL_NUMERO, COL_ANO, COL_LINK_ORIG, COL_LINK_ATU}
+missing = [c for c in needed if c not in base.columns]
+if missing:
+    st.error(f"Colunas ausentes no CSV: {missing}")
     st.stop()
 
-base = base[["tipo_sigla", "numero", "ano"]].dropna().drop_duplicates()
-base["tipo_sigla"] = base["tipo_sigla"].astype(str).str.upper().str.strip()
-base["numero"] = base["numero"].astype(int)
-base["ano"] = base["ano"].astype(int)
+# normaliza e mantém metadados úteis
+base[COL_TIPO] = base[COL_TIPO].astype(str).str.upper().str.strip()
+base[COL_NUMERO] = pd.to_numeric(base[COL_NUMERO], errors="coerce")
+base[COL_ANO] = pd.to_numeric(base[COL_ANO], errors="coerce")
+base = base.dropna(subset=[COL_TIPO, COL_NUMERO, COL_ANO])
+base[COL_NUMERO] = base[COL_NUMERO].astype(int)
+base[COL_ANO] = base[COL_ANO].astype(int)
 
-if somente_amostra:
-    base = base.head(30)
+# remove duplicatas (por tipo/numero/ano)
+base = base.drop_duplicates(subset=[COL_TIPO, COL_NUMERO, COL_ANO]).reset_index(drop=True)
 
-st.markdown(f"✅ Registros carregados (metadados): **{len(base)}**")
+st.markdown(f"✅ Normas carregadas: **{len(base)}**")
 
-# Monta tabela final “larga”
-def montar_tabela_final(df_meta: pd.DataFrame) -> pd.DataFrame:
-    df = df_meta.copy()
-    df["url_portal"] = df.apply(lambda r: url_portal(r["tipo_sigla"], r["numero"], r["ano"]), axis=1)
-    df["url_api_original"] = df.apply(lambda r: url_api(r["tipo_sigla"], r["numero"], r["ano"], API_ORIGINAL), axis=1)
-    df["url_api_atualizado"] = df.apply(lambda r: url_api(r["tipo_sigla"], r["numero"], r["ano"], API_ATUALIZADO), axis=1)
-
-    # campos a preencher
-    df["texto_original"] = ""
-    df["texto_atualizado"] = ""
-    df["status_original"] = ""
-    df["status_atualizado"] = ""
-    df["coletado_em"] = ""
-    df["hash_original"] = ""
-    df["hash_atualizado"] = ""
-    return df
-
-final = montar_tabela_final(base)
-
-st.dataframe(final.head(50), use_container_width=True)
+# mostra preview
+with st.expander("👀 Ver prévia (metadados)", expanded=False):
+    st.dataframe(base.head(50), use_container_width=True)
 
 # =================================================
-# COLETA
+# TABELA FINAL
 # =================================================
-st.subheader("🚀 Coletar textos via Dados Abertos (142=original, 572=atualizado)")
+def montar_final(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["tipo_sigla"] = out[COL_TIPO]
+    out["numero"] = out[COL_NUMERO]
+    out["ano"] = out[COL_ANO]
+    out["url_portal"] = out.apply(lambda r: url_portal(r["tipo_sigla"], r["numero"], r["ano"]), axis=1)
 
-col1, col2, col3 = st.columns([1.2, 1.2, 2])
-coletar_original = col1.checkbox("Coletar texto original (142)", value=True)
-coletar_atualizado = col2.checkbox("Coletar texto atualizado (572)", value=True)
-limite = col3.number_input("Limite de normas a coletar agora (para evitar travas)", min_value=1, max_value=5000, value=min(300, len(final)))
+    out["url_original"] = out[COL_LINK_ORIG].fillna("").astype(str)
+    out["url_atualizado"] = out[COL_LINK_ATU].fillna("").astype(str)
+
+    out["texto_original"] = ""
+    out["texto_atualizado"] = ""
+    out["status_original"] = ""
+    out["status_atualizado"] = ""
+    out["hash_original"] = ""
+    out["hash_atualizado"] = ""
+    out["coletado_em"] = ""
+    return out
+
+final = montar_final(base)
+
+st.subheader("🚀 Coletar textos (usando links do CSV)")
+col1, col2, col3, col4 = st.columns([1.2, 1.2, 2, 1])
+coletar_orig = col1.checkbox("Coletar original", value=True)
+coletar_atu = col2.checkbox("Coletar atualizado", value=True)
+limite = col3.number_input("Limite por execução", min_value=1, max_value=10000, value=min(300, len(final)))
+amostra_debug = col4.checkbox("Amostra 30 (debug)", value=False)
 
 if st.button("▶️ Iniciar coleta"):
-    if not coletar_original and not coletar_atualizado:
-        st.warning("Marque pelo menos uma opção (original e/ou atualizado).")
+    if not coletar_orig and not coletar_atu:
+        st.warning("Marque original e/ou atualizado.")
         st.stop()
 
     df = final.copy()
-    df = df.head(int(limite)).reset_index(drop=True)
+    if amostra_debug:
+        df = df.head(30).reset_index(drop=True)
+    else:
+        df = df.head(int(limite)).reset_index(drop=True)
 
     barra = st.progress(0)
-    status = st.empty()
+    info = st.empty()
     t0 = time.time()
 
     for i, row in df.iterrows():
-        tipo = row["tipo_sigla"]
-        numero = int(row["numero"])
-        ano = int(row["ano"])
-
-        if coletar_original:
-            txt, code, u = fetch_texto_api(tipo, numero, ano, API_ORIGINAL)
+        if coletar_orig:
+            txt, code = fetch_texto_por_link(row["url_original"])
             df.at[i, "texto_original"] = txt
             df.at[i, "status_original"] = str(code)
             df.at[i, "hash_original"] = sha256_text(txt) if txt else ""
 
-        if coletar_atualizado:
-            txt, code, u = fetch_texto_api(tipo, numero, ano, API_ATUALIZADO)
+        if coletar_atu:
+            txt, code = fetch_texto_por_link(row["url_atualizado"])
             df.at[i, "texto_atualizado"] = txt
             df.at[i, "status_atualizado"] = str(code)
             df.at[i, "hash_atualizado"] = sha256_text(txt) if txt else ""
@@ -256,29 +263,29 @@ if st.button("▶️ Iniciar coleta"):
 
         if (i + 1) % 10 == 0:
             elapsed = time.time() - t0
-            status.write(f"Processadas **{i+1}/{len(df)}** | tempo decorrido: **{elapsed/60:.1f} min**")
+            info.write(f"Processadas **{i+1}/{len(df)}** | tempo: **{elapsed/60:.1f} min**")
 
         barra.progress((i + 1) / len(df))
 
-    st.success("✅ Coleta finalizada (para o lote selecionado).")
+    st.success("✅ Coleta finalizada para o lote.")
     st.dataframe(df.head(50), use_container_width=True)
 
-    # Download do CSV final
-    buffer = BytesIO()
-    df.to_csv(buffer, index=False, encoding="utf-8-sig")
+    # Download CSV final
+    buff = BytesIO()
+    df.to_csv(buff, index=False, encoding="utf-8-sig")
     st.download_button(
         "⬇️ Baixar CSV final (com textos)",
-        data=buffer.getvalue(),
+        data=buff.getvalue(),
         file_name=f"LegislacaoMineira_{'_'.join(map(str, sorted(set(df['ano']))))}_com_textos.csv",
         mime="text/csv"
     )
 
-    # Também oferece versão compactada (opcional)
-    buffer_gz = BytesIO()
-    df.to_csv(buffer_gz, index=False, encoding="utf-8-sig", compression="gzip")
+    # Download gz opcional
+    buff_gz = BytesIO()
+    df.to_csv(buff_gz, index=False, encoding="utf-8-sig", compression="gzip")
     st.download_button(
         "⬇️ Baixar CSV final (gzip)",
-        data=buffer_gz.getvalue(),
+        data=buff_gz.getvalue(),
         file_name=f"LegislacaoMineira_{'_'.join(map(str, sorted(set(df['ano']))))}_com_textos.csv.gz",
         mime="application/gzip"
     )
