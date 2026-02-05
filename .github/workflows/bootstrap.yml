@@ -1,0 +1,32 @@
+name: Bootstrap index
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Build full index
+        env:
+          YEAR_FROM: "1835"
+          YEAR_TO: "2025"
+          MAX_REQ: "300000"
+          PAUSE: "0.15"
+          RECHECK_WINDOW: "0"
+        run: python build_index.py
+
+      - name: Upload index artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-zip
+          path: index.zip
