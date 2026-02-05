@@ -120,7 +120,9 @@ def github_headers() -> Dict[str, str]:
     return h
 
 def fetch_latest_release_info(owner: str, repo: str) -> dict:
-    url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    TAG = os.getenv("RELEASE_TAG", _get_secret(["github", "tag"], "index-latest"))
+url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{TAG}"
+
     r = requests.get(url, headers=github_headers(), timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
