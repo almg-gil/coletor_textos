@@ -1,0 +1,54 @@
+name: Build and publish index.zip (Release)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"   # diário 06:00 UTC (ajuste se quiser)
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-index
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Ajuste estes envs conforme seu desenho:
+      # - Bootstrap histórico grande: YEAR_FROM=1835 e MAX_REQ alto (vai demorar).
+      # - Atualização diária: anos recentes + orçamento baixo.
+      - name: Build index.zip
+        env:
+          YEAR_FROM: "2022"
+          YEAR_TO: "2026"
+          MAX_REQ: "4000"
+          PAUSE: "0.25"
+          RECHECK_WINDOW: "600"
+        run: python build_index.py
+
+      - name: Publish/Update GitHub Release (tag: index-latest)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: index-latest
+          name: Index latest
+          prerelease: false
+          files: index.zip
+          fail_on_unmatched_files: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
