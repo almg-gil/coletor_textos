@@ -12,12 +12,9 @@ import streamlit as st
 from whoosh import index
 from whoosh.fields import Schema, TEXT, ID, NUMERIC
 from whoosh.qparser import MultifieldParser, OrGroup
-from whoosh.query import And, Term, Every, Or
+from whoosh.query import And, Term, Every, Or, NumericRange
 
 
-# =========================
-# CONFIG / SECRETS
-# =========================
 TYPES = [
     "ADT","CON","DCS","DCJ","DEC","DNE","DSN","DEL","DLB","DCE","EMC",
     "LEI","LEA","LCP","LDL","LCO","OSV","PRT","PTC","RAL"
@@ -46,17 +43,11 @@ META_PATH = os.path.join(DATA_DIR, "release_meta.json")
 REQUEST_TIMEOUT = 30
 
 
-# =========================
-# UI
-# =========================
 st.set_page_config(page_title="Motor de Busca ALMG (Release Index)", layout="wide")
 st.title("📚 Motor de Busca ALMG — Índice via Release (Whoosh)")
 st.caption("Baixa index.zip do GitHub Release e permite busca booleana + filtros por campos (com multiselect de tipos).")
 
 
-# =========================
-# UTIL
-# =========================
 def mkdirp(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -96,9 +87,6 @@ def clean_extract_zip(zip_bytes: bytes) -> None:
             z.extract(member, path=".")
 
 
-# =========================
-# GITHUB RELEASE (por tag)
-# =========================
 def github_headers() -> Dict[str, str]:
     h = {"Accept": "application/vnd.github+json", "User-Agent": "streamlit-almg-search"}
     if GITHUB_TOKEN:
@@ -147,11 +135,8 @@ def save_local_release_meta(remote_release: dict, zip_hash: str) -> None:
     save_json(META_PATH, meta)
 
 
-# =========================
-# WHOOSH
-# =========================
 def get_schema() -> Schema:
-    # fallback mínimo (se índice não existir ainda)
+    # fallback mínimo
     return Schema(
         doc_id=ID(stored=True, unique=True),
         tipo_sigla=ID(stored=True),
@@ -184,7 +169,6 @@ def search(ix, expr: str, filtros: Dict, limit: int = 20):
 
     filter_terms = []
 
-    # ✅ tipos multiselect -> OR(Term(...), Term(...))
     tipos_sel = filtros.get("tipos", [])
     if tipos_sel:
         filter_terms.append(Or([Term("tipo_sigla", t.upper()) for t in tipos_sel]))
@@ -195,11 +179,13 @@ def search(ix, expr: str, filtros: Dict, limit: int = 20):
 
     ano = filtros.get("ano")
     if ano:
-        filter_terms.append(Term("ano", int(ano)))
+        y = int(ano)
+        filter_terms.append(NumericRange("ano", y, y))
 
     numero = filtros.get("numero")
     if numero:
-        filter_terms.append(Term("numero", int(numero)))
+        n = int(numero)
+        filter_terms.append(NumericRange("numero", n, n))
 
     q = And([base_q] + filter_terms) if filter_terms else base_q
 
@@ -220,9 +206,6 @@ def search(ix, expr: str, filtros: Dict, limit: int = 20):
         return out
 
 
-# =========================
-# BAIXAR ÍNDICE DO RELEASE
-# =========================
 def ensure_index_from_release(force: bool = False) -> Tuple[bool, str]:
     if not GITHUB_OWNER or not GITHUB_REPO:
         return False, "Configure owner/repo nos Secrets do Streamlit ([github] owner=... repo=...)."
@@ -261,9 +244,6 @@ def ensure_index_from_release(force: bool = False) -> Tuple[bool, str]:
         return False, f"Falha ao baixar/extrair index.zip: {e}"
 
 
-# =========================
-# SIDEBAR
-# =========================
 with st.sidebar:
     st.header("⚙️ Fonte do índice (GitHub Release)")
     st.write(f"Repo: **{GITHUB_OWNER}/{GITHUB_REPO}**" if (GITHUB_OWNER and GITHUB_REPO) else "Repo: **(não configurado)**")
@@ -305,9 +285,6 @@ except Exception:
     st.sidebar.metric("Docs no índice", 0)
 
 
-# =========================
-# BUSCA (com multiselect de tipos)
-# =========================
 st.subheader("🔎 Buscar no índice (booleana + campos)")
 
 col1, col2 = st.columns([2, 1])
@@ -318,11 +295,8 @@ expr = col1.text_input(
 limit = col2.number_input("Qtde de resultados", min_value=5, max_value=200, value=30, step=5)
 
 f1, f2, f3, f4 = st.columns(4)
-
-# ✅ Dropdown com multiselect
-f_tipos = f1.multiselect("tipo_sigla (opcional)", TYPES, default=[])
-
-f_ano = f2.text_input("ano (opcional)", value="")
+f_tipos = f1.multiselect("tipo_sigla (opcional)", TYPES, default=["LEI"])
+f_ano = f2.text_input("ano (opcional)", value="2026")
 f_num = f3.text_input("numero (opcional)", value="")
 f_versao = f4.selectbox("versao (opcional)", ["", "Original", "Consolidado"], index=0)
 
