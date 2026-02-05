@@ -26,9 +26,9 @@ jobs:
 
       - name: Build index.zip
         env:
-          YEAR_FROM: '2022'
+          YEAR_FROM: '2026'
           YEAR_TO: '2026'
-          MAX_REQ: '4000'
+          MAX_REQ: '200'
           PAUSE: '0.25'
           RECHECK_WINDOW: '600'
         run: python build_index.py
