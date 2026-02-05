@@ -16,7 +16,7 @@ from whoosh.query import And, Term, Every
 
 
 # =================================================
-# CONFIG BÁSICA
+# CONFIG / SECRETS
 # =================================================
 def _get_secret(path: List[str], default: str = "") -> str:
     cur = st.secrets
@@ -47,9 +47,7 @@ REQUEST_TIMEOUT = 30
 # =================================================
 st.set_page_config(page_title="Motor de Busca ALMG (Index Release)", layout="wide")
 st.title("📚 Motor de Busca ALMG — Índice via Release (Whoosh)")
-st.caption(
-    "O app baixa o índice pronto (index.zip) do Release do GitHub (tag fixa) e serve busca booleana com filtros."
-)
+st.caption("O app baixa o índice pronto (index.zip) do GitHub Release (tag fixa) e serve busca booleana com filtros.")
 
 
 # =================================================
@@ -58,17 +56,22 @@ st.caption(
 def mkdirp(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
+
 def file_exists(path: str) -> bool:
     return os.path.exists(path) and os.path.isfile(path)
+
 
 def dir_exists(path: str) -> bool:
     return os.path.exists(path) and os.path.isdir(path)
 
+
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
+
 def now_iso() -> str:
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 def load_json(path: str, default: dict) -> dict:
     try:
@@ -79,11 +82,13 @@ def load_json(path: str, default: dict) -> dict:
         pass
     return default
 
+
 def save_json(path: str, data: dict) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
 
 def clean_extract_zip(zip_bytes: bytes) -> None:
     """
@@ -99,7 +104,7 @@ def clean_extract_zip(zip_bytes: bytes) -> None:
 
 
 # =================================================
-# GITHUB RELEASE - FETCH POR TAG (index-latest)
+# GITHUB RELEASE - FETCH POR TAG
 # =================================================
 def github_headers() -> Dict[str, str]:
     h = {
@@ -110,11 +115,13 @@ def github_headers() -> Dict[str, str]:
         h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return h
 
+
 def fetch_release_info_by_tag(owner: str, repo: str, tag: str) -> dict:
     url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
     r = requests.get(url, headers=github_headers(), timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
+
 
 def pick_asset(release_json: dict, asset_name: str) -> Optional[dict]:
     for a in release_json.get("assets", []):
@@ -122,25 +129,33 @@ def pick_asset(release_json: dict, asset_name: str) -> Optional[dict]:
             return a
     return None
 
+
 def download_asset_bytes(asset: dict) -> bytes:
+    """
+    Baixa asset usando browser_download_url (bom para repos públicos).
+    Se o repo for privado, você precisará token e baixar via API de assets.
+    """
     url = asset.get("browser_download_url")
     if not url:
         raise RuntimeError("Asset não tem browser_download_url.")
-    # download público; se repo for privado, você precisará mudar para API de asset com token
     r = requests.get(url, headers={"User-Agent": "streamlit-almg-search"}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.content
 
+
 def index_is_ready() -> bool:
     return dir_exists(INDEX_DIR) and index.exists_in(INDEX_DIR)
 
+
 def current_local_release_meta() -> dict:
     return load_json(META_PATH, default={})
+
 
 def should_download(remote_release: dict, local_meta: dict) -> bool:
     remote_id = remote_release.get("id")
     local_id = local_meta.get("release_id")
     return (remote_id is not None) and (remote_id != local_id)
+
 
 def save_local_release_meta(remote_release: dict, zip_hash: str) -> None:
     meta = {
@@ -159,6 +174,7 @@ def save_local_release_meta(remote_release: dict, zip_hash: str) -> None:
 # WHOOSH
 # =================================================
 def get_schema() -> Schema:
+    # fallback caso não haja índice baixado (evita crash)
     return Schema(
         doc_id=ID(stored=True, unique=True),
         tipo_sigla=KEYWORD(stored=True, commas=False, lowercase=False),
@@ -173,6 +189,7 @@ def get_schema() -> Schema:
         content_hash=ID(stored=True),
     )
 
+
 @st.cache_resource(show_spinner=False)
 def open_index_cached(index_dir: str):
     if index.exists_in(index_dir):
@@ -180,9 +197,11 @@ def open_index_cached(index_dir: str):
     mkdirp(index_dir)
     return index.create_in(index_dir, get_schema())
 
+
 def count_docs(ix) -> int:
     with ix.searcher() as s:
         return s.doc_count()
+
 
 def search(ix, expr: str, filtros: Dict, limit: int = 20):
     parser = MultifieldParser(["texto"], schema=ix.schema, group=OrGroup)
@@ -205,16 +224,18 @@ def search(ix, expr: str, filtros: Dict, limit: int = 20):
         results = s.search(q, limit=limit)
         out = []
         for r in results:
-            out.append({
-                "doc_id": r.get("doc_id"),
-                "tipo_sigla": r.get("tipo_sigla"),
-                "numero": r.get("numero"),
-                "ano": r.get("ano"),
-                "versao": r.get("versao"),
-                "url": r.get("url"),
-                "coletado_em": r.get("coletado_em"),
-                "score": float(r.score),
-            })
+            out.append(
+                {
+                    "doc_id": r.get("doc_id"),
+                    "tipo_sigla": r.get("tipo_sigla"),
+                    "numero": r.get("numero"),
+                    "ano": r.get("ano"),
+                    "versao": r.get("versao"),
+                    "url": r.get("url"),
+                    "coletado_em": r.get("coletado_em"),
+                    "score": float(r.score),
+                }
+            )
         return out
 
 
@@ -246,6 +267,7 @@ def ensure_index_from_release(force: bool = False) -> Tuple[bool, str]:
     try:
         zip_bytes = download_asset_bytes(asset)
         zhash = sha256_bytes(zip_bytes)
+
         clean_extract_zip(zip_bytes)
 
         if not index_is_ready():
@@ -264,7 +286,11 @@ def ensure_index_from_release(force: bool = False) -> Tuple[bool, str]:
 # =================================================
 with st.sidebar:
     st.header("⚙️ Fonte do índice (GitHub Release)")
-    st.write(f"Repo: **{GITHUB_OWNER}/{GITHUB_REPO}**" if (GITHUB_OWNER and GITHUB_REPO) else "Repo: **(não configurado)**")
+    if GITHUB_OWNER and GITHUB_REPO:
+        st.write(f"Repo: **{GITHUB_OWNER}/{GITHUB_REPO}**")
+    else:
+        st.write("Repo: **(não configurado)**")
+
     st.write(f"Tag do Release: **{RELEASE_TAG}**")
     st.write(f"Asset esperado: **{ASSET_NAME}**")
 
@@ -277,20 +303,31 @@ with st.sidebar:
     auto_on_start = colA.checkbox("Baixar ao abrir", value=True)
     force_update_btn = colB.button("Atualizar índice agora")
 
+
 if auto_on_start and "bootstrapped" not in st.session_state:
     st.session_state["bootstrapped"] = True
     with st.spinner("Verificando/baixando índice do Release…"):
         ok, msg = ensure_index_from_release(force=False)
-    st.success(msg) if ok else st.error(msg)
+    if ok:
+        st.success(msg)
+    else:
+        st.error(msg)
+
 
 if force_update_btn:
     with st.spinner("Forçando atualização do índice…"):
         ok, msg = ensure_index_from_release(force=True)
         st.cache_resource.clear()
-    st.success(msg) if ok else st.error(msg)
+    if ok:
+        st.success(msg)
+    else:
+        st.error(msg)
 
+
+# Abre índice (se não existir, cria vazio como fallback)
 ix = open_index_cached(INDEX_DIR)
 
+# métricas
 try:
     st.sidebar.metric("Docs no índice", count_docs(ix))
 except Exception:
@@ -305,7 +342,7 @@ st.subheader("🔎 Buscar no índice (booleana + campos)")
 col1, col2 = st.columns([2, 1])
 expr = col1.text_input(
     "Busca booleana (AND/OR/NOT, parênteses, aspas)",
-    value='("transparência" OR publicidade) AND contrato'
+    value='("transparência" OR publicidade) AND contrato',
 )
 limit = col2.number_input("Qtde de resultados", min_value=5, max_value=100, value=20, step=5)
 
@@ -328,6 +365,7 @@ if st.button("Buscar"):
     if filtros["ano"] and not filtros["ano"].isdigit():
         st.error("O campo 'ano' deve ser numérico (ou vazio).")
         st.stop()
+
     if filtros["numero"] and not filtros["numero"].isdigit():
         st.error("O campo 'numero' deve ser numérico (ou vazio).")
         st.stop()
