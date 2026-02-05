@@ -3,16 +3,13 @@ import pandas as pd
 import requests
 from io import BytesIO
 
-# -------------------------------------------------
-# CONFIGURAÇÃO DA PÁGINA
-# -------------------------------------------------
-st.set_page_config(page_title="Coletor de Textos ALMG (API)", layout="wide")
-st.title("📄 Coletor de Textos de Normas da ALMG")
-st.markdown("1. Envie um arquivo com `tipo_sigla`, `numero`, `ano`  \n2. Selecione os anos desejados  \n3. Gere o CSV com os textos via API oficial da ALMG")
+st.set_page_config(page_title="Coletor Automático de Textos da ALMG", layout="wide")
+st.title("📄 Coletor Automático de Normas da ALMG")
+st.markdown("1. Digite o ano desejado  \n2. O app buscará todas as normas publicadas nesse ano  \n3. Os textos serão extraídos via API oficial da ALMG")
 
-# -------------------------------------------------
-# FUNÇÃO DE EXTRAÇÃO USANDO A API
-# -------------------------------------------------
+# ---------------------------
+# Função para extrair texto via API
+# ---------------------------
 def extrair_texto_api(tipo, numero, ano, versao):
     try:
         tipo_doc = 142 if versao == "Original" else 572
@@ -23,81 +20,71 @@ def extrair_texto_api(tipo, numero, ano, versao):
             "tipoDoc": tipo_doc
         }
         headers = {"accept": "application/json"}
-
         r = requests.get(url, params=params, headers=headers, timeout=15)
         r.raise_for_status()
-
         data = r.json()
-        conteudo = data.get("conteudo", "").strip()
+        return data.get("conteudo", "").strip()
+    except:
+        return ""  # Se der erro, retorna texto vazio
 
-        if conteudo:
-            return conteudo
-        else:
-            return ""  # Retorna vazio se não encontrou conteúdo
-
-    except Exception as e:
-        return ""  # Em caso de erro, retorna vazio para manter consistência
-
-# -------------------------------------------------
-# UPLOAD E TRATAMENTO DO ARQUIVO
-# -------------------------------------------------
-arquivo = st.file_uploader("📤 Envie um arquivo CSV ou Excel com as normas", type=["csv", "xlsx"])
-
-if arquivo:
+# ---------------------------
+# Função para buscar lista de normas por ano
+# ---------------------------
+def obter_normas_por_ano(ano):
+    url = f"https://dadosabertos.almg.gov.br/arquivos/legislacao-mineira/{ano}.csv"
     try:
-        df = pd.read_csv(arquivo) if arquivo.name.endswith(".csv") else pd.read_excel(arquivo)
+        df = pd.read_csv(url, sep=";", encoding="utf-8")
+        df = df[["tipo", "numero", "ano"]].dropna().drop_duplicates()
+        df.columns = ["tipo_sigla", "numero", "ano"]
+        return df
     except Exception as e:
-        st.error(f"Erro ao ler o arquivo: {e}")
-        st.stop()
+        st.error(f"Erro ao baixar normas do ano {ano}: {e}")
+        return pd.DataFrame()
 
-    colunas_necessarias = {"tipo_sigla", "numero", "ano"}
-    if not colunas_necessarias.issubset(df.columns):
-        st.error("⚠️ O arquivo deve conter as colunas: tipo_sigla, numero, ano")
-        st.stop()
+# ---------------------------
+# Interface Streamlit
+# ---------------------------
+ano_desejado = st.text_input("📅 Digite o ano desejado", placeholder="Ex: 2025")
 
-    # Limpeza
-    df = df[["tipo_sigla", "numero", "ano"]].dropna().drop_duplicates()
-    df["ano"] = df["ano"].astype(str)
+if ano_desejado:
+    if st.button("🔎 Buscar normas"):
+        st.info(f"Buscando normas publicadas em {ano_desejado}…")
+        df_normas = obter_normas_por_ano(ano_desejado)
 
-    # Filtro por ano
-    anos_disponiveis = sorted(df["ano"].unique(), reverse=True)
-    anos_selecionados = st.multiselect("📅 Selecione o(s) ano(s)", anos_disponiveis)
-
-    if anos_selecionados:
-        df_filtrado = df[df["ano"].isin(anos_selecionados)]
-        st.markdown(f"🔎 Normas encontradas: **{len(df_filtrado)}**")
-
-        if len(df_filtrado) > 100:
-            st.warning("⚠️ Limite temporário: selecione até 100 normas por vez para evitar lentidão.")
+        if df_normas.empty:
+            st.warning("⚠️ Nenhuma norma encontrada para o ano informado.")
             st.stop()
 
-        if st.button(f"🚀 Coletar textos via API para {len(df_filtrado)} normas"):
-            st.info("🔄 Coletando… aguarde alguns minutos.")
-            resultados = []
-            barra = st.progress(0)
-            total = len(df_filtrado)
+        st.success(f"✅ {len(df_normas)} normas encontradas para {ano_desejado}. Iniciando coleta dos textos…")
 
-            for idx, row in df_filtrado.iterrows():
-                tipo, numero, ano = row["tipo_sigla"], row["numero"], row["ano"]
+        resultados = []
+        barra = st.progress(0)
 
-                for versao in ["Original", "Consolidado"]:
-                    texto = extrair_texto_api(tipo, numero, ano, versao)
-                    resultados.append({
-                        "tipo_sigla": tipo,
-                        "numero": numero,
-                        "ano": ano,
-                        "versao": versao,
-                        "texto": texto
-                    })
+        for i, row in df_normas.iterrows():
+            tipo, numero, ano = row["tipo_sigla"], row["numero"], row["ano"]
 
-                barra.progress((idx + 1) / total)
+            for versao in ["Original", "Consolidado"]:
+                texto = extrair_texto_api(tipo, numero, ano, versao)
+                resultados.append({
+                    "tipo_sigla": tipo,
+                    "numero": numero,
+                    "ano": ano,
+                    "versao": versao,
+                    "texto": texto
+                })
 
-            df_resultado = pd.DataFrame(resultados)
-            st.success("✅ Coleta finalizada!")
-            st.dataframe(df_resultado.head(50))
+            barra.progress((i + 1) / len(df_normas))
 
-            # Download do CSV
-            buffer = BytesIO()
-            df_resultado.to_csv(buffer, index=False, encoding="utf-8-sig")
-            st.download_button("⬇️ Baixar CSV com os textos", data=buffer.getvalue(),
-                               file_name="textos_normas_api_almg.csv", mime="text/csv")
+        df_resultado = pd.DataFrame(resultados)
+        st.success("✅ Coleta concluída!")
+        st.dataframe(df_resultado.head(50))
+
+        # Exportar como CSV
+        buffer = BytesIO()
+        df_resultado.to_csv(buffer, index=False, encoding="utf-8-sig")
+        st.download_button(
+            label="⬇️ Baixar CSV com os textos",
+            data=buffer.getvalue(),
+            file_name=f"textos_normas_{ano_desejado}.csv",
+            mime="text/csv"
+        )
