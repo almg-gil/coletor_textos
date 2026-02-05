@@ -1,98 +1,136 @@
 import streamlit as st
 import pandas as pd
 import requests
-import time
+from bs4 import BeautifulSoup
 from io import BytesIO
 
-# -------------------------------
-# CONFIGURAÇÃO INICIAL DO APP
-# -------------------------------
-st.set_page_config(page_title="Coletor de Textos da ALMG", layout="wide")
-st.title("📄 Coletor de Textos das Normas da ALMG")
-st.markdown("Este app consulta a [API da ALMG](https://dadosabertos.almg.gov.br) para buscar textos oficiais de normas por ano.\n\n> **Atenção:** o processo é lento pois respeita limites de acesso da API.")
+# -------------------------------------------------
+# CONFIGURAÇÃO DA PÁGINA
+# -------------------------------------------------
+st.set_page_config(page_title="Coletor de Textos ALMG", layout="wide")
+st.title("📄 Coletor de Textos de Normas da ALMG")
+st.markdown("1. Envie um arquivo com `tipo_sigla`, `numero`, `ano`  \n2. Selecione os anos  \n3. Gere o CSV com os textos")
 
-# -------------------------------
-# FUNÇÃO PARA BUSCAR LISTA DE NORMAS
-# -------------------------------
-@st.cache_data(show_spinner=False)
-def buscar_normas_do_ano(ano):
+# -------------------------------------------------
+# FUNÇÃO DE EXTRAÇÃO DE TEXTO HTML
+# -------------------------------------------------
+def extrair_texto_html(url):
     try:
-        url = f"https://dadosabertos.almg.gov.br/api/v2/legislacaoNorma?formato=json&ano={ano}"
-        resp = requests.get(url, timeout=30)
+        resp = requests.get(
+            url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
         resp.raise_for_status()
-        return resp.json()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Tentativa 1: span tradicional usado por LEI/DEC
+        span = soup.find("span", class_="js_interpretarLinks textNorma js_interpretarLinksDONE")
+        if span:
+            texto = span.get_text(separator="\n", strip=True)
+            if len(texto) > 50:
+                return texto
+
+        # Tentativa 2: extrair do <main> (usado por DCS, DCE, etc.)
+        main = soup.find("main")
+        if main:
+            # Remove elementos irrelevantes
+            for tag in main.find_all(["nav", "header", "footer", "script", "style", "button", "aside"]):
+                tag.decompose()
+
+            # Remove blocos com "compartilhar"
+            for div in main.find_all("div"):
+                if "compartilhar" in div.get_text(strip=True).lower():
+                    div.decompose()
+
+            texto = main.get_text(separator="\n", strip=True)
+
+            # Captura a partir de palavras-chave
+            for marcador in ["DELIBERA", "RESOLVE", "Art. 1º", "Art. 1o", "Art. 1"]:
+                if marcador in texto:
+                    return marcador + "\n" + texto.split(marcador, 1)[-1].strip()
+
+            # Se não encontrou marcador, retorna tudo (se for significativo)
+            if len(texto) > 100:
+                return texto.strip()
+
+        return "❌ Texto não encontrado"
     except Exception as e:
-        st.error(f"Erro ao buscar normas do ano {ano}: {e}")
-        return []
+        return f"❌ Erro ao acessar: {str(e)}"
 
-# -------------------------------
-# FUNÇÃO PARA BUSCAR TEXTO DE UMA NORMA
-# -------------------------------
-def buscar_texto_da_norma(tipo, numero, ano, tipo_doc):
-    base_url = f"https://dadosabertos.almg.gov.br/api/v2/legislacao/mineira/{tipo}/{numero}/{ano}/documento"
-    params = {
-        "conteudo": "true",
-        "texto": "true",
-        "tipoDoc": tipo_doc  # 142 = original, 572 = consolidado
+# -------------------------------------------------
+# GERAÇÃO DAS URLs
+# -------------------------------------------------
+def gerar_links(tipo, numero, ano):
+    base = f"https://www.almg.gov.br/legislacao-mineira/texto/{tipo}/{numero}/{ano}"
+    return {
+        "Original": base + "/",
+        "Consolidado": base + "/?cons=1"
     }
+
+# -------------------------------------------------
+# UPLOAD E TRATAMENTO DO ARQUIVO
+# -------------------------------------------------
+arquivo = st.file_uploader("📤 Envie um arquivo CSV ou Excel", type=["csv", "xlsx"])
+
+if arquivo:
     try:
-        r = requests.get(base_url, params=params, timeout=30)
-        r.raise_for_status()
-        dados = r.json()
-        if dados and isinstance(dados, list) and "conteudo" in dados[0]:
-            return dados[0]["conteudo"]
-        else:
-            return ""
-    except:
-        return ""
-
-# -------------------------------
-# ENTRADA DO USUÁRIO
-# -------------------------------
-ano = st.text_input("📅 Digite o ano desejado", value="2026")
-if st.button("🔍 Buscar normas"):
-    if not ano.isdigit():
-        st.error("Ano inválido.")
+        df = pd.read_csv(arquivo) if arquivo.name.endswith(".csv") else pd.read_excel(arquivo)
+    except Exception as e:
+        st.error(f"Erro ao ler o arquivo: {e}")
         st.stop()
 
-    st.info(f"📥 Buscando normas publicadas em {ano}…")
-    normas = buscar_normas_do_ano(ano)
-
-    if not normas:
-        st.warning("⚠️ Nenhuma norma encontrada para o ano informado.")
+    colunas_necessarias = {"tipo_sigla", "numero", "ano"}
+    if not colunas_necessarias.issubset(df.columns):
+        st.error("⚠️ O arquivo deve conter as colunas: tipo_sigla, numero, ano")
         st.stop()
 
-    st.success(f"✅ {len(normas)} normas encontradas.")
-    progresso = st.progress(0)
-    resultados = []
+    # Limpeza básica
+    df = df[["tipo_sigla", "numero", "ano"]].dropna().drop_duplicates()
+    df["ano"] = df["ano"].astype(str)
 
-    for i, norma in enumerate(normas):
-        tipo = norma.get("tipo", "").strip()
-        numero = norma.get("numero")
-        ano_norma = norma.get("ano")
+    # Filtro por ano
+    anos_disponiveis = sorted(df["ano"].unique(), reverse=True)
+    anos_selecionados = st.multiselect("📅 Selecione o(s) ano(s)", anos_disponiveis)
 
-        # Pega textos original e consolidado com pausa entre requisições
-        texto_original = buscar_texto_da_norma(tipo, numero, ano_norma, tipo_doc=142)
-        time.sleep(1.5)  # espera para evitar bloqueio
+    if anos_selecionados:
+        df_filtrado = df[df["ano"].isin(anos_selecionados)]
+        st.markdown(f"🔎 Normas encontradas: **{len(df_filtrado)}**")
 
-        texto_consolidado = buscar_texto_da_norma(tipo, numero, ano_norma, tipo_doc=572)
-        time.sleep(1.5)  # espera para evitar bloqueio
+        # Limite de segurança
+        if len(df_filtrado) > 50:
+            st.warning("⚠️ Limite temporário: selecione até 50 normas por vez para evitar travamentos.")
+            st.stop()
 
-        resultados.append({
-            "tipo_sigla": tipo,
-            "numero": numero,
-            "ano": ano_norma,
-            "texto_original": texto_original.strip(),
-            "texto_consolidado": texto_consolidado.strip()
-        })
+        if st.button(f"🚀 Coletar textos para {len(df_filtrado)} normas"):
+            st.info("🔄 Coletando… aguarde alguns minutos.")
+            resultados = []
+            barra = st.progress(0)
+            total = len(df_filtrado)
 
-        progresso.progress((i + 1) / len(normas))
+            for i, row in df_filtrado.iterrows():
+                tipo, numero, ano = row["tipo_sigla"], row["numero"], row["ano"]
+                links = gerar_links(tipo, numero, ano)
 
-    df_resultado = pd.DataFrame(resultados)
-    st.dataframe(df_resultado.head(10))
+                for versao, url in links.items():
+                    texto = extrair_texto_html(url)
+                    resultados.append({
+                        "tipo_sigla": tipo,
+                        "numero": numero,
+                        "ano": ano,
+                        "versao": versao,
+                        "url": url,
+                        "texto": texto
+                    })
 
-    # Baixar CSV
-    buffer = BytesIO()
-    df_resultado.to_csv(buffer, index=False, encoding="utf-8-sig")
-    st.download_button("⬇️ Baixar CSV com os textos", data=buffer.getvalue(),
-                       file_name=f"normas_{ano}.csv", mime="text/csv")
+                barra.progress((i + 1) / total)
+
+            df_resultado = pd.DataFrame(resultados)
+            st.success("✅ Coleta finalizada!")
+            st.dataframe(df_resultado.head(50))
+
+            # Download do CSV
+            buffer = BytesIO()
+            df_resultado.to_csv(buffer, index=False, encoding="utf-8-sig")
+            st.download_button("⬇️ Baixar CSV com os textos", data=buffer.getvalue(),
+                               file_name="textos_normas_almg.csv", mime="text/csv")
