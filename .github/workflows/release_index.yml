@@ -3,28 +3,21 @@ name: Build and publish index.zip (Release)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: '0 6 * * *'
 
 permissions:
   contents: write
-
-concurrency:
-  group: release-index
-  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
@@ -33,20 +26,16 @@ jobs:
 
       - name: Build index.zip
         env:
-          YEAR_FROM: "2022"
-          YEAR_TO: "2026"
-          MAX_REQ: "4000"
-          PAUSE: "0.25"
-          RECHECK_WINDOW: "600"
+          YEAR_FROM: '2022'
+          YEAR_TO: '2026'
+          MAX_REQ: '4000'
+          PAUSE: '0.25'
+          RECHECK_WINDOW: '600'
         run: python build_index.py
 
-      - name: Publish Release (tag: index-latest)
+      - name: Publish Release (index-latest)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: index-latest
-          name: Index latest
-          prerelease: false
-          files: index.zip
-          fail_on_unmatched_files: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: 'index-latest'
+          name: 'Index latest'
+          files: 'index.zip'
