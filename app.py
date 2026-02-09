@@ -1,252 +1,340 @@
-import streamlit as st
+import os
+import re
+import time
+import glob
+import base64
+import hashlib
+from datetime import datetime
+from io import BytesIO
+from typing import List, Tuple, Optional
+
+import pandas as pd
 import requests
+import streamlit as st
 from bs4 import BeautifulSoup
-from pathlib import Path
-import shutil
 
-from whoosh import index
-from whoosh.fields import Schema, TEXT, ID
-from whoosh.qparser import MultifieldParser, AndGroup, OrGroup
-from whoosh.analysis import RegexTokenizer, LowercaseFilter, StopFilter, StemFilter, CharsetFilter
-from whoosh.support.charset import default_charset
-
-# -------------------------------------------------
-# CONFIGURAÇÃO DA PÁGINA
-# -------------------------------------------------
-st.set_page_config(
-    page_title="Busca Booleana – Normas ALMG",
-    layout="wide"
+# ================================================= #
+# CONFIG
+# ================================================= #
+st.set_page_config(page_title="Coletor de Textos ALMG (CSV por ano + API)", layout="wide")
+st.title("📄 Coletor de Textos — ALMG (CSV por ano no GitHub)")
+st.caption(
+    "Lê automaticamente data_csv/LegislacaoMineira_YYYY.csv, baixa textos dos links "
+    "(ex.: Dados Abertos tipoDoc=142/572) e gera CSV final com texto original + atualizado."
 )
 
-st.title("📚 Banco de Normas ALMG + 🔎 Busca Booleana")
+DATA_DIR = "data_csv"
+FILE_PATTERN = os.path.join(DATA_DIR, "LegislacaoMineira_*.csv*")  # .csv e .csv.gz
+REQUEST_TIMEOUT = 30
+MIN_INTERVAL_SECONDS = 1.0  # respeitar 1 req/s (recomendado p/ dados abertos)
 
-# -------------------------------------------------
-# CONSTANTES
-# -------------------------------------------------
-TIPOS_NORMA = [
-    "LEI", "DEC", "DNE", "DSN", "PRT",
-    "RAL", "DLB", "PTC", "DCS", "LCP"
-]
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "streamlit-almg-coletor/1.0"})
 
-INDICE_DIR = Path("indice_whoosh")
+# Colunas do seu CSV
+COL_TIPO = "Tipo"
+COL_NUMERO = "Numero"
+COL_ANO = "Ano"
+COL_LINK_ORIG = "LinkTextoOriginal"
+COL_LINK_ATU = "LinkTextoAtualizado"
+COL_FONTE = "Fonte"
 
-# -------------------------------------------------
-# FUNÇÕES DE COLETA
-# -------------------------------------------------
-def gerar_url(tipo, numero, ano, consolidado=False):
-    base = f"https://www.almg.gov.br/legislacao-mineira/texto/{tipo}/{numero}/{ano}"
-    return base + ("/?cons=1" if consolidado else "/")
+# ================================================= #
+# UTIL
+# ================================================= #
+def now_iso() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def limpar_texto(texto: str) -> str:
+    texto = re.sub(r"[ \t]+", " ", texto or "")
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+    return texto.strip()
+
+def sha256_text(s: str) -> str:
+    return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
+
+def url_portal(tipo: str, numero: int, ano: int) -> str:
+    return f"https://www.almg.gov.br/legislacao-mineira/texto/{tipo}/{numero}/{ano}/"
+
+_last_req_ts = 0.0
+
+def rate_limited_get(url: str) -> requests.Response:
+    global _last_req_ts
+    elapsed = time.time() - _last_req_ts
+    if elapsed < MIN_INTERVAL_SECONDS:
+        time.sleep(MIN_INTERVAL_SECONDS - elapsed)
+    resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+    _last_req_ts = time.time()
+    return resp
+
+def extract_first_href(html_snippet: str) -> str:
+    if not isinstance(html_snippet, str) or not html_snippet.strip():
+        return ""
+    m = re.search(r'href="([^"]+)"', html_snippet)
+    return m.group(1) if m else ""
+
+def looks_like_base64(s: str) -> bool:
+    if not s or len(s) < 200:
+        return False
+    return re.fullmatch(r"[A-Za-z0-9+/=\s]+", s) is not None
+
+def parse_api_text(obj) -> str:
+    if isinstance(obj, str):
+        return obj.strip()
+    if not isinstance(obj, dict):
+        return ""
+    
+    # chaves diretas comuns
+    for k in ["conteudo", "texto", "html", "content", "documento", "body"]:
+        v = obj.get(k)
+        if isinstance(v, str) and len(v.strip()) > 20:
+            return v.strip()
+            
+    # chaves comuns para base64
+    for k in ["conteudoBase64", "arquivoBase64", "base64", "pdfBase64", "binarioBase64"]:
+        v = obj.get(k)
+        if isinstance(v, str) and len(v.strip()) > 200:
+            return v.strip()
+            
+    # recursivo em nós comuns
+    for k in ["dados", "data", "item", "resultado", "result"]:
+        v = obj.get(k)
+        if isinstance(v, dict):
+            t = parse_api_text(v)
+            if t: return t
+            
+    # listas
+    for k in ["itens", "items", "resultados", "results"]:
+        arr = obj.get(k)
+        if isinstance(arr, list):
+            for el in arr:
+                if isinstance(el, dict):
+                    t = parse_api_text(el)
+                    if t: return t
+    return ""
+
+def strip_html_and_decode_if_needed(texto: str) -> str:
+    if not texto:
+        return ""
+    texto = texto.strip()
+    
+    if looks_like_base64(texto):
+        try:
+            decoded = base64.b64decode(texto, validate=False)
+            decoded_txt = decoded.decode("utf-8", errors="ignore").strip()
+            if len(decoded_txt) > 50:
+                texto = decoded_txt
+        except Exception:
+            pass
+            
+    if "<" in texto and ">" in texto:
+        soup = BeautifulSoup(texto, "html.parser")
+        return limpar_texto(soup.get_text("\n", strip=True))
+    return limpar_texto(texto)
+
+def fetch_texto_por_link(url: str) -> Tuple[str, int, str]:
+    if not url or not isinstance(url, str) or not url.strip():
+        return "", 0, "url_vazia"
+    try:
+        r = rate_limited_get(url.strip())
+        status = r.status_code
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        
+        if status != 200:
+            return "", status, f"status={status} ctype={ctype}"
+            
+        if "application/json" in ctype or "dadosabertos.almg.gov.br/api/" in url:
+            try:
+                j = r.json()
+                raw = parse_api_text(j)
+                txt = strip_html_and_decode_if_needed(raw)
+                if not txt:
+                    keys = list(j.keys())[:25] if isinstance(j, dict) else []
+                    return "", status, f"mode=json_sem_texto keys={keys}"
+                return txt, status, "mode=json_ok"
+            except Exception:
+                pass
+                
+        if "text/" in ctype or "html" in ctype:
+            html = r.text or ""
+            soup = BeautifulSoup(html, "html.parser")
+            main = soup.find("main") or soup
+            for tag in main.find_all(["nav", "header", "footer", "script", "style", "button", "aside"]):
+                tag.decompose()
+            txt = limpar_texto(main.get_text("\n", strip=True))
+            return txt, status, "mode=html_ok"
+            
+        if "pdf" in ctype or "octet-stream" in ctype:
+            return "", status, f"mode=binary({ctype})"
+            
+        txt = strip_html_and_decode_if_needed(r.text or "")
+        return txt, status, "mode=fallback"
+    except Exception as e:
+        return "", 0, f"erro={e}"
+
+# ================================================= #
+# CSV DO REPO
+# ================================================= #
+@st.cache_data(show_spinner=False)
+def list_year_files() -> List[Tuple[int, str]]:
+    files = sorted(glob.glob(FILE_PATTERN))
+    out = []
+    for f in files:
+        m = re.search(r"LegislacaoMineira_(\d{4})\.csv(\.gz)?$", os.path.basename(f))
+        if m:
+            out.append((int(m.group(1)), f))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+def read_csv_smart(path: str) -> pd.DataFrame:
+    seps = ["\t", ";", ","]
+    if path.endswith(".gz"):
+        for sep in seps:
+            try:
+                df = pd.read_csv(path, compression="gzip", sep=sep, dtype=str, engine="python")
+                if df.shape[1] >= 3: return df
+            except Exception: pass
+    else:
+        for sep in seps:
+            try:
+                df = pd.read_csv(path, sep=sep, dtype=str, engine="python")
+                if df.shape[1] >= 3: return df
+            except Exception: pass
+    return pd.read_csv(path, dtype=str, engine="python")
 
 @st.cache_data(show_spinner=False)
-def extrair_texto_html(url):
-    try:
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+def load_year_csv(path: str) -> pd.DataFrame:
+    return read_csv_smart(path)
 
-        span = soup.find("span", class_="js_interpretarLinks textNorma js_interpretarLinksDONE")
-        if span:
-            texto = span.get_text(separator="\n", strip=True)
-            if len(texto) > 50:
-                return texto
-
-        main = soup.find("main")
-        if not main:
-            return None
-
-        for tag in main.find_all(["nav", "header", "footer", "script", "style", "aside"]):
-            tag.decompose()
-
-        texto = main.get_text(separator="\n", strip=True)
-
-        if len(texto) > 100:
-            return texto
-
-        return None
-
-    except Exception:
-        return None
-
-
-# -------------------------------------------------
-# WHOOSH – ANALYZER E SCHEMA
-# -------------------------------------------------
-def analyzer_pt():
-    a = RegexTokenizer() | LowercaseFilter() | CharsetFilter(default_charset)
-    try:
-        a |= StopFilter(lang="pt")
-        a |= StemFilter(lang="pt")
-    except Exception:
-        pass
-    return a
-
-
-SCHEMA = Schema(
-    doc_id=ID(stored=True, unique=True),
-    tipo=ID(stored=True),
-    numero=ID(stored=True),
-    ano=ID(stored=True),
-    versao=ID(stored=True),
-    url=ID(stored=True),
-    texto=TEXT(stored=True, analyzer=analyzer_pt())
-)
-
-
-def criar_indice():
-    if INDICE_DIR.exists():
-        shutil.rmtree(INDICE_DIR)
-    INDICE_DIR.mkdir()
-    return index.create_in(INDICE_DIR, SCHEMA)
-
-
-def abrir_indice():
-    if not INDICE_DIR.exists():
-        return None
-    return index.open_dir(INDICE_DIR)
-
-
-# -------------------------------------------------
-# SIDEBAR – CONFIGURAÇÃO DO BANCO
-# -------------------------------------------------
-st.sidebar.header("⚙️ Configuração do Banco")
-
-if "tipos_sel" not in st.session_state:
-    st.session_state["tipos_sel"] = TIPOS_NORMA.copy()
-
-if st.sidebar.button("✅ Selecionar todos"):
-    st.session_state["tipos_sel"] = TIPOS_NORMA.copy()
-
-if st.sidebar.button("❌ Limpar seleção"):
-    st.session_state["tipos_sel"] = []
-
-tipos_selecionados = st.sidebar.multiselect(
-    "Tipos de norma",
-    TIPOS_NORMA,
-    default=st.session_state["tipos_sel"]
-)
-
-st.session_state["tipos_sel"] = tipos_selecionados
-
-ano_ini = st.sidebar.number_input("Ano inicial", value=1989)
-ano_fim = st.sidebar.number_input("Ano final", value=2025)
-
-max_numero = st.sidebar.number_input(
-    "Número máximo por ano (limite técnico)",
-    value=300,
-    step=50
-)
-
-versao_cons = st.sidebar.checkbox("Incluir versão consolidada", value=True)
-
-# -------------------------------------------------
-# CONSTRUÇÃO DO BANCO
-# -------------------------------------------------
-st.subheader("📥 Construção / Atualização do Banco")
-
-if st.button("🚀 Construir banco de dados"):
-    if not tipos_selecionados:
-        st.warning("Selecione ao menos um tipo de norma.")
-        st.stop()
-
-    ix = criar_indice()
-    writer = ix.writer(limitmb=512)
-
-    barra = st.progress(0)
-    total = len(tipos_selecionados) * (ano_fim - ano_ini + 1) * max_numero
-    contador = 0
-    inseridos = 0
-
-    for tipo in tipos_selecionados:
-        for ano in range(ano_ini, ano_fim + 1):
-            for numero in range(1, max_numero + 1):
-                contador += 1
-
-                url = gerar_url(tipo, numero, ano, False)
-                texto = extrair_texto_html(url)
-
-                if texto:
-                    doc_id = f"{tipo}-{numero}-{ano}-O"
-                    writer.add_document(
-                        doc_id=doc_id,
-                        tipo=tipo,
-                        numero=str(numero),
-                        ano=str(ano),
-                        versao="Original",
-                        url=url,
-                        texto=texto
-                    )
-                    inseridos += 1
-
-                    if versao_cons:
-                        url_c = gerar_url(tipo, numero, ano, True)
-                        texto_c = extrair_texto_html(url_c)
-                        if texto_c:
-                            writer.add_document(
-                                doc_id=f"{tipo}-{numero}-{ano}-C",
-                                tipo=tipo,
-                                numero=str(numero),
-                                ano=str(ano),
-                                versao="Consolidado",
-                                url=url_c,
-                                texto=texto_c
-                            )
-                            inseridos += 1
-
-                barra.progress(contador / total)
-
-    writer.commit()
-    st.success(f"✅ Banco construído! Documentos indexados: {inseridos}")
-
-# -------------------------------------------------
-# BUSCA
-# -------------------------------------------------
-st.divider()
-st.subheader("🔎 Busca Booleana nos Textos")
-
-ix = abrir_indice()
-if not ix:
-    st.info("O banco ainda não foi criado.")
+# Fluxo Streamlit
+year_files = list_year_files()
+if not year_files:
+    st.error(f"Não encontrei arquivos em {DATA_DIR} com o padrão LegislacaoMineira_YYYY.csv.")
     st.stop()
 
-consulta = st.text_input(
-    "Consulta",
-    placeholder='Ex: (educação OR escola) AND NOT revoga'
-)
+anos_disponiveis = [y for y, _ in year_files]
+map_ano_arquivo = {y: p for y, p in year_files}
 
-col1, col2 = st.columns(2)
-with col1:
-    operador = st.selectbox("Operador padrão", ["AND", "OR"])
-with col2:
-    limite = st.number_input("Máx. resultados", 10, 2000, 200)
+colA, colB = st.columns([2, 1])
+anos_sel = colA.multiselect("📅 Selecione ano(s)", options=anos_disponiveis, default=[anos_disponiveis[0]])
+debug_on = colB.checkbox("Mostrar debug", value=True)
 
-if consulta:
-    parser = MultifieldParser(
-        ["texto", "tipo", "ano", "numero"],
-        schema=ix.schema,
-        group=AndGroup if operador == "AND" else OrGroup
-    )
+if not anos_sel:
+    st.stop()
 
-    try:
-        q = parser.parse(consulta)
-    except Exception as e:
-        st.error(f"Erro na consulta: {e}")
+dfs = [load_year_csv(map_ano_arquivo[a]) for a in anos_sel]
+base = pd.concat(dfs, ignore_index=True)
+
+# Validação e Normalização
+needed = {COL_TIPO, COL_NUMERO, COL_ANO, COL_LINK_ORIG}
+missing = [c for c in needed if c not in base.columns]
+if missing:
+    st.error(f"Colunas ausentes no CSV: {missing}")
+    st.stop()
+
+base[COL_TIPO] = base[COL_TIPO].astype(str).str.upper().str.strip()
+base[COL_NUMERO] = pd.to_numeric(base[COL_NUMERO], errors="coerce")
+base[COL_ANO] = pd.to_numeric(base[COL_ANO], errors="coerce")
+base = base.dropna(subset=[COL_TIPO, COL_NUMERO, COL_ANO])
+base[COL_NUMERO] = base[COL_NUMERO].astype(int)
+base[COL_ANO] = base[COL_ANO].astype(int)
+
+if COL_LINK_ATU not in base.columns:
+    base[COL_LINK_ATU] = ""
+
+if COL_FONTE in base.columns:
+    base["LinkPublicacao"] = base[COL_FONTE].apply(extract_first_href)
+else:
+    base["LinkPublicacao"] = ""
+
+base = base.drop_duplicates(subset=[COL_TIPO, COL_NUMERO, COL_ANO]).reset_index(drop=True)
+st.markdown(f"✅ Normas carregadas: **{len(base)}**")
+
+# ================================================= #
+# MONTAR TABELA FINAL
+# ================================================= #
+def montar_final(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["tipo_sigla"] = out[COL_TIPO]
+    out["numero"] = out[COL_NUMERO]
+    out["ano"] = out[COL_ANO]
+    out["url_portal"] = out.apply(lambda r: url_portal(r["tipo_sigla"], r["numero"], r["ano"]), axis=1)
+    out["url_original"] = out[COL_LINK_ORIG].fillna("").astype(str)
+    out["url_atualizado"] = out[COL_LINK_ATU].fillna("").astype(str)
+    
+    for col in ["texto_original", "texto_atualizado", "status_original", "status_atualizado", 
+                "hash_original", "hash_atualizado", "coletado_em"]:
+        out[col] = ""
+    
+    if debug_on:
+        out["debug_original"] = ""
+        out["debug_atualizado"] = ""
+    return out
+
+final = montar_final(base)
+
+# ================================================= #
+# COLETA
+# ================================================= #
+st.subheader("🚀 Coletar textos (a partir dos links do CSV)")
+c1, c2, c3, c4 = st.columns([1.2, 1.2, 2, 1])
+coletar_orig = c1.checkbox("Coletar original", value=True)
+coletar_atu = c2.checkbox("Coletar atualizado", value=True)
+limite = c3.number_input("Limite por execução", min_value=1, max_value=20000, value=min(300, len(final)))
+amostra = c4.checkbox("Amostra 30", value=False)
+
+if st.button("▶️ Iniciar coleta"):
+    if not coletar_orig and not coletar_atu:
+        st.warning("Marque original e/ou atualizado.")
         st.stop()
 
-    with ix.searcher() as searcher:
-        resultados = searcher.search(q, limit=limite)
+    df = final.copy()
+    df = df.head(30 if amostra else int(limite)).reset_index(drop=True)
+    
+    barra = st.progress(0)
+    info = st.empty()
+    t0 = time.time()
 
-        st.markdown(f"**{len(resultados)} resultado(s)**")
+    for i, row in df.iterrows():
+        # Coleta Original
+        if coletar_orig:
+            txt, code, dbg = fetch_texto_por_link(row["url_original"])
+            df.at[i, "texto_original"] = txt
+            df.at[i, "status_original"] = str(code)
+            df.at[i, "hash_original"] = sha256_text(txt) if txt else ""
+            if debug_on: df.at[i, "debug_original"] = dbg
+        
+        # Coleta Atualizado
+        if coletar_atu:
+            if row["url_atualizado"]:
+                txt, code, dbg = fetch_texto_por_link(row["url_atualizado"])
+                df.at[i, "texto_atualizado"] = txt
+                df.at[i, "status_atualizado"] = str(code)
+                df.at[i, "hash_atualizado"] = sha256_text(txt) if txt else ""
+                if debug_on: df.at[i, "debug_atualizado"] = dbg
+            else:
+                df.at[i, "status_atualizado"] = "url_vazia"
+                if debug_on: df.at[i, "debug_atualizado"] = "url_vazia"
+        
+        df.at[i, "coletado_em"] = now_iso()
+        
+        if (i + 1) % 10 == 0:
+            elapsed = time.time() - t0
+            info.write(f"Processadas **{i+1}/{len(df)}** | tempo: **{elapsed/60:.1f} min**")
+            barra.progress((i + 1) / len(df))
 
-        for r in resultados:
-            trecho = r.highlights("texto") or r["texto"][:400]
-            st.markdown(
-                f"""
-**{r['tipo']} {r['numero']}/{r['ano']} – {r['versao']}**  
-{r['url']}
+    st.success("✅ Coleta finalizada para o lote.")
+    st.dataframe(df.head(50), use_container_width=True)
 
-{trecho}
-<hr/>
-""",
-                unsafe_allow_html=True
-            )
+    # Downloads
+    buff = BytesIO()
+    df.to_csv(buff, index=False, encoding="utf-8-sig")
+    st.download_button(
+        "⬇️ Baixar CSV final (com textos)", 
+        data=buff.getvalue(), 
+        file_name=f"ALMG_textos_lote.csv", 
+        mime="text/csv"
+    )
+else:
+    st.caption("Dica: rode primeiro com **Amostra 30** para validar.")
+    st.dataframe(final.head(30), use_container_width=True)
