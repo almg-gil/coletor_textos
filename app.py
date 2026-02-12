@@ -2,20 +2,40 @@ import streamlit as st
 import requests
 import pandas as pd
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(layout="wide")
-st.title("Coletor de Textos ALMG - Histórico Completo")
+st.title("Coletor Histórico de Textos ALMG")
 
-API_BASE = "https://dadosabertos.almg.gov.br/api/v2/legislacao/mineira"
+API_BASE = "https://dadosabertos.almg.gov.br/api/v2"
 
 HEADERS = {
     "Accept": "application/json",
     "User-Agent": "Mozilla/5.0"
 }
 
+
+def listar_normas_por_ano(ano):
+    url = f"{API_BASE}/legislacao/mineira"
+    params = {
+        "ano": ano,
+        "pagina": 1,
+        "itensPorPagina": 1000
+    }
+
+    try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=20)
+        if resp.status_code != 200:
+            return []
+
+        data = resp.json()
+        return data.get("listaNorma", [])
+
+    except Exception:
+        return []
+
+
 def buscar_texto(tipo, numero, ano, tipo_doc):
-    url = f"{API_BASE}/{tipo}/{numero}/{ano}/documento"
+    url = f"{API_BASE}/legislacao/mineira/{tipo}/{numero}/{ano}/documento"
     params = {
         "conteudo": "true",
         "texto": "true",
@@ -23,12 +43,11 @@ def buscar_texto(tipo, numero, ano, tipo_doc):
     }
 
     try:
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=20)
         if resp.status_code != 200:
             return None
 
         data = resp.json()
-
         lista = data.get("listaNormaDocumento", [])
         if not lista:
             return None
@@ -39,61 +58,49 @@ def buscar_texto(tipo, numero, ano, tipo_doc):
         return None
 
 
-def processar_norma(row):
-    tipo = row["tipo_sigla"]
-    numero = row["numero"]
-    ano = row["ano"]
+anos = st.slider("Selecione o intervalo de anos", 1947, 2026, (1947, 2026))
 
-    original = buscar_texto(tipo, numero, ano, 142)
-    consolidado = buscar_texto(tipo, numero, ano, 572)
+if st.button("🚀 Iniciar coleta automática"):
 
-    return {
-        "tipo_sigla": tipo,
-        "numero": numero,
-        "ano": ano,
-        "texto_original": original,
-        "texto_consolidado": consolidado
-    }
+    resultados = []
+    progress = st.progress(0)
 
+    total_anos = anos[1] - anos[0] + 1
+    ano_atual = 0
 
-st.markdown("### Envie um CSV com colunas: tipo_sigla, numero, ano")
+    for ano in range(anos[0], anos[1] + 1):
 
-arquivo = st.file_uploader("Arquivo CSV", type=["csv"])
+        normas = listar_normas_por_ano(ano)
 
-if arquivo:
+        for norma in normas:
+            tipo = norma.get("siglaTipoNorma")
+            numero = norma.get("numero")
 
-    df = pd.read_csv(arquivo)
+            texto_original = buscar_texto(tipo, numero, ano, 142)
+            texto_consolidado = buscar_texto(tipo, numero, ano, 572)
 
-    anos = sorted(df["ano"].unique())
-    anos_sel = st.multiselect("Selecione os anos", anos, default=anos)
+            resultados.append({
+                "tipo_sigla": tipo,
+                "numero": numero,
+                "ano": ano,
+                "texto_original": texto_original,
+                "texto_consolidado": texto_consolidado
+            })
 
-    df = df[df["ano"].isin(anos_sel)]
+        ano_atual += 1
+        progress.progress(ano_atual / total_anos)
 
-    st.write(f"Normas selecionadas: {len(df)}")
+    df = pd.DataFrame(resultados)
 
-    if st.button("🚀 Iniciar coleta"):
+    st.success("Coleta finalizada!")
 
-        resultados = []
-        progress = st.progress(0)
+    st.dataframe(df.head())
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(processar_norma, row) for _, row in df.iterrows()]
+    csv = df.to_csv(index=False).encode("utf-8-sig")
 
-            for i, future in enumerate(as_completed(futures)):
-                resultados.append(future.result())
-                progress.progress((i + 1) / len(futures))
-
-        df_resultado = pd.DataFrame(resultados)
-
-        st.success("Coleta finalizada!")
-
-        st.dataframe(df_resultado.head())
-
-        csv = df_resultado.to_csv(index=False).encode("utf-8-sig")
-
-        st.download_button(
-            label="⬇️ Baixar CSV completo",
-            data=csv,
-            file_name="textos_normas_almg.csv",
-            mime="text/csv"
-        )
+    st.download_button(
+        label="⬇️ Baixar CSV completo",
+        data=csv,
+        file_name="textos_normas_almg.csv",
+        mime="text/csv"
+    )
